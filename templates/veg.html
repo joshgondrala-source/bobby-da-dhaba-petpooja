@@ -2,9 +2,9 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Veg Items</title>
+    <title>Veg Items — Bobby Da Dhaba</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <meta name="theme-color" content="#2d5a27">
+    <meta name="theme-color" content="#5c1010">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
@@ -13,12 +13,12 @@
             --surface: #ffffff;
             --ink: #1e1e1e;
             --muted: #8a8279;
-            --brand: #2d5a27;
-            --brand-dark: #1e3d1a;
-            --accent: #e8a838;
-            --accent-light: #f5d78e;
-            --veg: #4a9b43;
-            --veg-light: #e8f5e6;
+            --brand: #5c1010;
+            --brand-dark: #3d0808;
+            --accent: #c8881e;
+            --accent-light: #f7e3b8;
+            --veg: #2f6b3a;
+            --veg-light: #daf0da;
             --radius: 18px;
             --shadow: 0 4px 20px rgba(0,0,0,0.08);
             --shadow-hover: 0 8px 32px rgba(45,90,39,0.15);
@@ -30,7 +30,10 @@
 
         body {
             font-family: 'Inter', sans-serif;
-            background: var(--bg);
+            background:
+                radial-gradient(circle at top left, rgba(200,136,30,.16) 0%, transparent 32%),
+                radial-gradient(circle at bottom right, rgba(92,16,16,.12) 0%, transparent 30%),
+                var(--bg);
             color: var(--ink);
             line-height: 1.5;
             min-height: 100vh;
@@ -43,7 +46,7 @@
             top: 0; z-index: 50;
             background: linear-gradient(135deg, var(--brand) 0%, var(--brand-dark) 100%);
             padding: 16px 20px 20px;
-            box-shadow: 0 4px 24px rgba(45,90,39,0.3);
+            box-shadow: 0 4px 24px rgba(92,16,16,0.3);
         }
 
         .header-bar {

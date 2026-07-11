@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Owner Dashboard - Sales Analytics</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@700;900&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #f6ebd8;
+            --bg2: #e8d8b8;
+            --paper: #fffdf8;
+            --brand: #5c1010;
+            --brand-dark: #3d0808;
+            --gold: #c8881e;
+            --line: #e7d8bf;
+            --ink: #1f140a;
+            --muted: #7f6b5b;
+            --radius: 22px;
+            --success: #2d7c3b;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: radial-gradient(circle at top left, #f9e7b7 0%, transparent 32%), radial-gradient(circle at bottom right, #d8af66 0%, transparent 28%), linear-gradient(180deg, var(--bg), var(--bg2));
+            color: var(--ink);
+            min-height: 100vh;
+            padding: 18px 16px 36px;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: linear-gradient(135deg, var(--brand), var(--brand-dark));
+            color: white;
+            border-radius: 24px;
+            padding: 24px 20px;
+            box-shadow: 0 12px 30px rgba(0,0,0,.18);
+            margin-bottom: 20px;
+        }
+
+        .header h1 {
+            font-family: 'Fraunces', serif;
+            font-size: 32px;
+            letter-spacing: 1px;
+            margin-bottom: 4px;
+        }
+
+        .header p {
+            color: #f8e4b2;
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .refresh-info {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid rgba(255,255,255,.2);
+            font-size: 13px;
+            color: #f8e4b2;
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+            margin-bottom: 20px;
+        }
+
+        .stat-card {
+            background: var(--paper);
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            padding: 18px;
+            box-shadow: 0 10px 24px rgba(0,0,0,.06);
+            text-align: center;
+        }
+
+        .stat-label {
+            font-size: 13px;
+            color: var(--muted);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-family: 'Fraunces', serif;
+            font-size: 28px;
+            color: var(--brand-dark);
+            font-weight: 900;
+        }
+
+        .stat-card.revenue {
+            grid-column: 1 / -1;
+            background: linear-gradient(135deg, rgba(200,136,30,.08), rgba(200,136,30,.04));
+            border: 2px solid var(--gold);
+        }
+
+        .stat-card.revenue .stat-value {
+            color: var(--gold);
+            font-size: 36px;
+        }
+
+        .bills-section {
+            background: var(--paper);
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            padding: 20px;
+            box-shadow: 0 10px 24px rgba(0,0,0,.06);
+        }
+
+        .section-title {
+            font-family: 'Fraunces', serif;
+            font-size: 20px;
+            color: var(--brand-dark);
+            margin-bottom: 14px;
+            padding-bottom: 12px;
+            border-bottom: 2px solid var(--line);
+        }
+
+        .bill-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 0;
+            border-bottom: 1px solid #f1e4cb;
+            font-size: 14px;
+        }
+
+        .bill-item:last-child {
+            border-bottom: none;
+        }
+
+        .bill-left {
+            display: flex;
+            gap: 12px;
+            flex: 1;
+        }
+
+        .bill-info {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .bill-info-time {
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .bill-right {
+            display: flex;
+            gap: 14px;
+            align-items: center;
+            justify-content: flex-end;
+        }
+
+        .bill-amount {
+            text-align: right;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .bill-total {
+            font-weight: 700;
+            color: var(--brand-dark);
+        }
+
+        .bill-gst {
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .no-bills {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--muted);
+        }
+
+        .no-bills-icon {
+            font-size: 48px;
+            margin-bottom: 12px;
+        }
+
+        .empty-message {
+            font-size: 16px;
+            margin-bottom: 6px;
+        }
+
+        .empty-submessage {
+            font-size: 13px;
+            color: #999;
+        }
+
+        .footer-nav {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 10px 16px;
+            border: none;
+            border-radius: 12px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            transition: all 0.2s ease;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--gold), #a96c0f);
+            color: white;
+            box-shadow: 0 6px 16px rgba(200,136,30,.24);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(200,136,30,.32);
+        }
+
+        .btn-secondary {
+            background: var(--paper);
+            color: var(--brand);
+            border: 2px solid var(--brand);
+        }
+
+        .btn-secondary:hover {
+            background: #f1e4cb;
+        }
+
+        .refresh-btn {
+            background: linear-gradient(135deg, var(--gold), #a96c0f);
+            color: white;
+            border: none;
+            padding: 8px 14px;
+            border-radius: 10px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 6px 16px rgba(200,136,30,.24);
+            transition: all 0.2s ease;
+        }
+
+        .refresh-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(200,136,30,.32);
+        }
+
+        .badge {
+            display: inline-block;
+            background: #e8f1eb;
+            color: var(--success);
+            padding: 4px 10px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        @media (max-width: 600px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .stat-card.revenue {
+                grid-column: 1;
+            }
+
+            .header h1 {
+                font-size: 24px;
+            }
+
+            .bill-left {
+                flex-direction: column;
+                gap: 6px;
+            }
+
+            .bill-right {
+                flex-direction: column;
+                align-items: flex-end;
+            }
+        }
+
+        @media (min-width: 700px) {
+            body { padding: 24px 32px 48px; }
+            .dashboard-grid {
+                gap: 18px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>Owner Dashboard</h1>
+            <p>Today's Sales Analytics</p>
+            <div class="refresh-info">
+                <span>📊 Last updated: <span id="update-time">just now</span></span>
+                <button class="refresh-btn" onclick="location.reload()">🔄 Refresh Now</button>
+            </div>
+        </div>
+
+        <!-- Stats Grid -->
+        <div class="dashboard-grid">
+            <div class="stat-card">
+                <div class="stat-label">Bills Finalized</div>
+                <div class="stat-value">{{ bill_count }}</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-label">Food Total</div>
+                <div class="stat-value">₹{{ total_food|int }}</div>
+            </div>
+
+            <div class="stat-card revenue">
+                <div class="stat-label">Total Revenue (With GST)</div>
+                <div class="stat-value">₹{{ total_revenue|round(2)|int }}</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-label">GST Collected (5%)</div>
+                <div class="stat-value">₹{{ total_gst|round(2)|int }}</div>
+            </div>
+        </div>
+
+        <!-- Finalized Bills Section -->
+        <div class="bills-section">
+            <div class="section-title">💳 Finalized Bills</div>
+            
+            {% if finalized_bills %}
+                {% for bill in finalized_bills %}
+                    <div class="bill-item">
+                        <div class="bill-left">
+                            <div>
+                                <strong>#KOT{{ bill.kot_number }}</strong>
+                            </div>
+                            <div class="bill-info">
+                                <span>Table: {{ bill.table }}</span>
+                                <span class="bill-info-time">{{ bill.time }}</span>
+                            </div>
+                        </div>
+                        <div class="bill-right">
+                            <div class="bill-amount">
+                                <span class="bill-total">₹{{ bill.total|round(2)|int }}</span>
+                                <span class="bill-gst">(+₹{{ bill.gst|round(2)|int }} GST)</span>
+                            </div>
+                            <div class="badge">✓ Paid</div>
+                        </div>
+                    </div>
+                {% endfor %}
+            {% else %}
+                <div class="no-bills">
+                    <div class="no-bills-icon">📋</div>
+                    <div class="empty-message">No finalized bills today</div>
+                    <div class="empty-submessage">Finalized bills will appear here once customers make payments</div>
+                </div>
+            {% endif %}
+        </div>
+
+        <!-- Footer Navigation -->
+        <div class="footer-nav">
+            <a href="/" class="btn btn-secondary">← Back to Home</a>
+            <a href="/manager" class="btn btn-primary">View Manager Dashboard</a>
+        </div>
+    </div>
+
+    <script>
+        // Update time display every minute
+        function updateTime() {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('en-US', { 
+                hour: '2-digit', 
+                minute: '2-digit',
+                second: '2-digit'
+            });
+            document.getElementById('update-time').textContent = timeStr;
+        }
+
+        updateTime();
+        setInterval(updateTime, 1000);
+
+        // Auto-refresh dashboard every 30 seconds
+        setInterval(function() {
+            fetch(window.location.href)
+                .then(response => response.text())
+                .then(html => {
+                    // Only update if there are changes to avoid jarring refreshes
+                    const tempDiv = document.createElement('div');
+                    tempDiv.innerHTML = html;
+                    const newStats = tempDiv.querySelector('.dashboard-grid').innerHTML;
+                    const currentStats = document.querySelector('.dashboard-grid').innerHTML;
+                    
+                    if (newStats !== currentStats) {
+                        location.reload();
+                    }
+                })
+                .catch(err => console.log('Auto-refresh check skipped'));
+        }, 30000);
+    </script>
+</body>
+</html>

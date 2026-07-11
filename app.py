@@ -1,14 +1,140 @@
 from flask import Flask, render_template, request
 from flask import redirect
 from datetime import datetime
+import os
+import sqlite3
+from urllib.parse import parse_qs, urlparse
 
 app = Flask(__name__)
-cart=[]
+DB_PATH = os.path.join(app.root_path, "restaurant.db")
+
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db():
+    with get_db_connection() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS tables (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_number INTEGER NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'AVAILABLE' CHECK (status IN ('AVAILABLE', 'OCCUPIED')),
+                occupied_since TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS table_cart_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_id INTEGER NOT NULL,
+                item_name TEXT NOT NULL,
+                unit_price INTEGER NOT NULL,
+                quantity INTEGER NOT NULL,
+                instructions TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (table_id) REFERENCES tables(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS kots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kot_number INTEGER UNIQUE,
+                table_id INTEGER NOT NULL,
+                kot_type TEXT NOT NULL CHECK (kot_type IN ('NEW TABLE', 'RUNNING TABLE')),
+                payment_status TEXT NOT NULL DEFAULT 'UNPAID' CHECK (payment_status IN ('UNPAID', 'PAID')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (table_id) REFERENCES tables(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS kot_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kot_id INTEGER NOT NULL,
+                item_name TEXT NOT NULL,
+                unit_price INTEGER NOT NULL,
+                quantity INTEGER NOT NULL,
+                instructions TEXT,
+                FOREIGN KEY (kot_id) REFERENCES kots(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS bill_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_id INTEGER NOT NULL,
+                requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+                FOREIGN KEY (table_id) REFERENCES tables(id)
+            );
+            """
+        )
+        conn.commit()
+
+
+init_db()
+
+
+def get_or_create_table_id(table_number):
+    table_key = (table_number or "").strip()
+
+    if not table_key:
+        return None
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM tables WHERE table_number = ?",
+            (table_key,)
+        ).fetchone()
+
+        if row:
+            return row["id"]
+
+        cursor = conn.execute(
+            "INSERT INTO tables (table_number) VALUES (?)",
+            (table_key,)
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def resolve_table_value():
+    table = request.form.get("table")
+
+    if not table:
+        table = request.args.get("table")
+
+    if not table and request.referrer:
+        ref_query = parse_qs(urlparse(request.referrer).query)
+        table_from_ref = ref_query.get("table", [None])[0]
+        if table_from_ref:
+            table = table_from_ref
+
+    if not table:
+        table = current_table
+
+    return (table or "").strip() or None
+
+
+def get_table_cart_items(table_id):
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                item_name AS name,
+                unit_price AS price,
+                quantity,
+                COALESCE(instructions, '') AS instructions
+            FROM table_cart_items
+            WHERE table_id = ?
+            ORDER BY id ASC
+            """,
+            (table_id,)
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
 current_table=None
-orders = []
-order_counter = 100
-bill_requests = []
-paid_tables = []
 
 # MENU DATA
 restaurant_menu = {
@@ -318,13 +444,13 @@ def dinein():
 
 @app.route("/menu")
 def menu():
-
     global current_table
 
-    table = request.args.get("table")
+    table = resolve_table_value()
 
     if table:
         current_table = table
+        get_or_create_table_id(table)
 
     return render_template(
         "menu.html",
@@ -376,145 +502,358 @@ def addtocart():
     quantity = int(request.form.get("quantity"))
     instructions = request.form.get("instructions")
 
-    cart.append({
-        "name": item_name,
-        "price": price,
-        "quantity": quantity,
-        "instructions": instructions
-    })
+    table_id = get_or_create_table_id(table)
+
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO table_cart_items (table_id, item_name, unit_price, quantity, instructions)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (table_id, item_name, price, quantity, instructions)
+        )
+        conn.commit()
+
+    table_cart = get_table_cart_items(table_id)
     grand_total = 0
 
-    for item in cart:
+    for item in table_cart:
       grand_total += item["price"] * item["quantity"]
 
     return render_template(
      "cart.html",
-     cart=cart,
+     cart=table_cart,
      grand_total=grand_total,
      table=table
     )
 @app.route("/cart")
 def showcart():
+    table = resolve_table_value()
+
+    table_cart = []
+
+    if table:
+        table_id = get_or_create_table_id(table)
+        table_cart = get_table_cart_items(table_id)
 
     grand_total = 0
 
-    for item in cart:
+    for item in table_cart:
         grand_total += item["price"] * item["quantity"]
-
-    table = request.args.get("table")
 
     return render_template(
         "cart.html",
-        cart=cart,
+        cart=table_cart,
         grand_total=grand_total,
         table=table
     )
 @app.route("/deleteitem", methods=["POST"])
 def deleteitem():
-
     item_name = request.form.get("item_name")
+    table = resolve_table_value()
 
-    for item in cart:
+    table_cart = []
 
-        if item["name"] == item_name:
-            cart.remove(item)
-            break
+    if table:
+        table_id = get_or_create_table_id(table)
+
+        with get_db_connection() as conn:
+            conn.execute(
+                """
+                DELETE FROM table_cart_items
+                WHERE id = (
+                    SELECT id
+                    FROM table_cart_items
+                    WHERE table_id = ? AND item_name = ?
+                    ORDER BY id ASC
+                    LIMIT 1
+                )
+                """,
+                (table_id, item_name)
+            )
+            conn.commit()
+
+        table_cart = get_table_cart_items(table_id)
+
     grand_total = 0
 
-    for item in cart:
+    for item in table_cart:
       grand_total += item["price"] * item["quantity"]
+
     return render_template(
         "cart.html",
-        cart=cart,
-        grand_total=grand_total
+        cart=table_cart,
+        grand_total=grand_total,
+        table=table
     )
 @app.route("/placeorder", methods=["POST"])
 def placeorder():
+    table = resolve_table_value()
 
-    global order_counter
-    global cart
+    if not table:
+        return redirect("/menu")
 
-    order_counter += 1
+    table_id = get_or_create_table_id(table)
+    table_cart = get_table_cart_items(table_id)
+
+    if not table_cart:
+        return redirect(f"/cart?table={table}")
 
     total = 0
 
-    for item in cart:
+    for item in table_cart:
         total += item["price"] * item["quantity"]
-    table_order_count = 0
 
-    for order in orders:
+    with get_db_connection() as conn:
+        unpaid_count_row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM kots
+            WHERE table_id = ? AND payment_status = 'UNPAID'
+            """,
+            (table_id,)
+        ).fetchone()
 
-      if order["table"] == current_table:
-          table_order_count += 1
-    orders.append({
-        "order_id": order_counter,
-        "table": current_table,
-        "items": cart.copy(),
-        "total": total,
-        "time": datetime.now().strftime("%I:%M %p"),
-        "status": "NEW TABLE" if table_order_count == 0 else "RUNNING TABLE"
-    })
+        unpaid_count = unpaid_count_row["count"]
+        kot_type = "NEW TABLE" if unpaid_count == 0 else "RUNNING TABLE"
 
-    cart.clear()
+        next_kot_row = conn.execute(
+            "SELECT COALESCE(MAX(kot_number), 100) + 1 AS next_kot FROM kots"
+        ).fetchone()
+        next_kot_number = next_kot_row["next_kot"]
 
-    table_orders = []
+        kot_cursor = conn.execute(
+            """
+            INSERT INTO kots (kot_number, table_id, kot_type, payment_status)
+            VALUES (?, ?, ?, 'UNPAID')
+            """,
+            (next_kot_number, table_id, kot_type)
+        )
+        kot_id = kot_cursor.lastrowid
+
+        conn.executemany(
+            """
+            INSERT INTO kot_items (kot_id, item_name, unit_price, quantity, instructions)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    kot_id,
+                    item["name"],
+                    item["price"],
+                    item["quantity"],
+                    item["instructions"]
+                )
+                for item in table_cart
+            ]
+        )
+
+        conn.execute(
+            """
+            UPDATE tables
+            SET
+                status = 'OCCUPIED',
+                occupied_since = COALESCE(occupied_since, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (table_id,)
+        )
+
+        conn.execute(
+            "DELETE FROM table_cart_items WHERE table_id = ?",
+            (table_id,)
+        )
+
+        table_orders_rows = conn.execute(
+            """
+            SELECT
+                k.kot_number AS order_id,
+                COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS total
+            FROM kots k
+            LEFT JOIN kot_items ki ON ki.kot_id = k.id
+            WHERE k.table_id = ? AND k.payment_status = 'UNPAID'
+            GROUP BY k.id, k.kot_number
+            ORDER BY k.id ASC
+            """,
+            (table_id,)
+        ).fetchall()
+
+        conn.commit()
+
+    table_orders = [dict(row) for row in table_orders_rows]
 
     table_total = 0
 
-    for order in orders:
-
-        if order["table"] == current_table:
-
-            table_orders.append(order)
-
-            table_total += order["total"]
+    for order in table_orders:
+        table_total += order["total"]
 
     return render_template(
         "order_success.html",
-        order_id=order_counter,
-        table=current_table,
+        order_id=next_kot_number,
+        table=table,
         total=total,
         table_orders=table_orders,
         table_total=table_total
     )
 @app.route("/kitchen")
 def kitchen():
+    with get_db_connection() as conn:
+        kot_rows = conn.execute(
+            """
+            SELECT
+                k.id,
+                k.kot_number,
+                k.kot_type,
+                k.created_at,
+                t.table_number
+            FROM kots k
+            INNER JOIN tables t ON t.id = k.table_id
+            WHERE k.payment_status = 'UNPAID'
+            ORDER BY k.id ASC
+            """
+        ).fetchall()
+
+        kitchen_orders = []
+
+        for kot in kot_rows:
+            item_rows = conn.execute(
+                """
+                SELECT item_name, quantity, COALESCE(instructions, '') AS instructions
+                FROM kot_items
+                WHERE kot_id = ?
+                ORDER BY id ASC
+                """,
+                (kot["id"],)
+            ).fetchall()
+
+            time_value = kot["created_at"]
+            try:
+                time_value = datetime.strptime(kot["created_at"], "%Y-%m-%d %H:%M:%S").strftime("%I:%M %p")
+            except (ValueError, TypeError):
+                pass
+
+            kitchen_orders.append({
+                "order_id": kot["kot_number"],
+                "status": kot["kot_type"],
+                "time": time_value,
+                "table": str(kot["table_number"]),
+                "items": [
+                    {
+                        "name": item["item_name"],
+                        "quantity": item["quantity"],
+                        "instructions": item["instructions"]
+                    }
+                    for item in item_rows
+                ]
+            })
 
     return render_template(
         "kitchen.html",
-        orders=orders
+        orders=kitchen_orders
     )
 @app.route("/requestbill", methods=["POST"])
 def requestbill():
+    table = resolve_table_value()
 
-    bill_requests.append({
-        "table": current_table
-    })
+    if not table:
+        return redirect("/menu")
+
+    table_id = get_or_create_table_id(table)
+
+    with get_db_connection() as conn:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM bill_requests
+            WHERE table_id = ? AND is_active = 1
+            LIMIT 1
+            """,
+            (table_id,)
+        ).fetchone()
+
+        if not existing:
+            conn.execute(
+                "INSERT INTO bill_requests (table_id, is_active) VALUES (?, 1)",
+                (table_id,)
+            )
+            conn.commit()
 
     return render_template(
         "bill_requested.html",
-        table=current_table
+        table=table
     )
 @app.route("/manager")
 def manager():
+    with get_db_connection() as conn:
+        bill_request_rows = conn.execute(
+            """
+            SELECT t.table_number
+            FROM bill_requests br
+            INNER JOIN tables t ON t.id = br.table_id
+            WHERE br.is_active = 1
+            ORDER BY br.id ASC
+            """
+        ).fetchall()
+
+        order_rows = conn.execute(
+            """
+            SELECT
+                k.kot_number AS order_id,
+                t.table_number,
+                COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS total
+            FROM kots k
+            INNER JOIN tables t ON t.id = k.table_id
+            LEFT JOIN kot_items ki ON ki.kot_id = k.id
+            WHERE k.payment_status = 'UNPAID'
+            GROUP BY k.id, k.kot_number, t.table_number
+            ORDER BY k.id ASC
+            """
+        ).fetchall()
+
+    manager_bill_requests = [
+        {"table": str(row["table_number"])}
+        for row in bill_request_rows
+    ]
+
+    manager_orders = [
+        {
+            "order_id": row["order_id"],
+            "table": str(row["table_number"]),
+            "total": row["total"]
+        }
+        for row in order_rows
+    ]
 
     return render_template(
         "manager.html",
-        bill_requests=bill_requests,
-        orders=orders
+        bill_requests=manager_bill_requests,
+        orders=manager_orders
     )
 @app.route("/generatebill", methods=["POST"])
 def generatebill():
 
     table = request.form.get("table")
 
-    food_total = float(
-        request.form.get("food_total")
-    )
+    if not table:
+        return redirect("/manager")
 
-    discount = float(
-        request.form.get("discount")
-    )
+    table_id = get_or_create_table_id(table)
+
+    with get_db_connection() as conn:
+        total_row = conn.execute(
+            """
+            SELECT COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS food_total
+            FROM kots k
+            INNER JOIN kot_items ki ON ki.kot_id = k.id
+            WHERE k.table_id = ? AND k.payment_status = 'UNPAID'
+            """,
+            (table_id,)
+        ).fetchone()
+
+    food_total = float(total_row["food_total"])
+
+    discount = float(request.form.get("discount", 0) or 0)
 
     gst = food_total * 0.05
 
@@ -542,23 +881,48 @@ def generatebill():
     )
 @app.route("/markpaid", methods=["POST"])
 def markpaid():
+    table = resolve_table_value()
 
-    table = request.form.get("table")
+    if table:
+        table_id = get_or_create_table_id(table)
 
-    global orders
-    global bill_requests
+        with get_db_connection() as conn:
+            conn.execute(
+                """
+                UPDATE kots
+                SET payment_status = 'PAID'
+                WHERE table_id = ? AND payment_status = 'UNPAID'
+                """,
+                (table_id,)
+            )
 
-    orders = [
-        order
-        for order in orders
-        if order["table"] != table
-    ]
+            conn.execute(
+                """
+                UPDATE tables
+                SET
+                    status = 'AVAILABLE',
+                    occupied_since = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (table_id,)
+            )
 
-    bill_requests = [
-        request
-        for request in bill_requests
-        if request["table"] != table
-    ]
+            conn.execute(
+                """
+                UPDATE bill_requests
+                SET is_active = 0
+                WHERE table_id = ? AND is_active = 1
+                """,
+                (table_id,)
+            )
+
+            conn.execute(
+                "DELETE FROM table_cart_items WHERE table_id = ?",
+                (table_id,)
+            )
+
+            conn.commit()
 
     return redirect("/manager")
 @app.route("/veg")
@@ -594,5 +958,76 @@ def takeaway():
     takeaway_token += 1
 
     return redirect(f"/menu?table={token}")
+
+
+@app.route("/owner")
+def owner():
+    """Owner dashboard showing today's total sales with GST"""
+    from datetime import date, datetime as dt
+    
+    today = date.today().strftime("%Y-%m-%d")
+    
+    with get_db_connection() as conn:
+        # Get all paid orders from today
+        paid_orders = conn.execute(
+            """
+            SELECT
+                k.id,
+                k.kot_number,
+                t.table_number,
+                k.created_at,
+                COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS food_total
+            FROM kots k
+            INNER JOIN tables t ON t.id = k.table_id
+            LEFT JOIN kot_items ki ON ki.kot_id = k.id
+            WHERE k.payment_status = 'PAID'
+            AND DATE(k.created_at) = ?
+            GROUP BY k.id, k.kot_number, t.table_number, k.created_at
+            ORDER BY k.created_at DESC
+            """,
+            (today,)
+        ).fetchall()
+        
+        # Calculate totals
+        total_food = 0
+        total_gst = 0
+        total_revenue = 0
+        
+        finalized_bills = []
+        
+        for order in paid_orders:
+            food_total = float(order["food_total"])
+            gst = food_total * 0.05
+            grand_total = food_total + gst
+            
+            total_food += food_total
+            total_gst += gst
+            total_revenue += grand_total
+            
+            time_value = order["created_at"]
+            try:
+                time_value = dt.strptime(order["created_at"], "%Y-%m-%d %H:%M:%S").strftime("%I:%M %p")
+            except (ValueError, TypeError):
+                pass
+            
+            finalized_bills.append({
+                "kot_number": order["kot_number"],
+                "table": str(order["table_number"]),
+                "food_total": food_total,
+                "gst": gst,
+                "total": grand_total,
+                "time": time_value
+            })
+    
+    return render_template(
+        "owner.html",
+        total_food=total_food,
+        total_gst=total_gst,
+        total_revenue=total_revenue,
+        finalized_bills=finalized_bills,
+        bill_count=len(finalized_bills)
+    )
+
+
 if __name__ == "__main__":
     app.run(debug=True) 

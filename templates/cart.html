@@ -447,6 +447,86 @@ document.querySelectorAll('.card-emoji[data-name]').forEach(el => {
   const match = EMOJI_MAP.find(([re]) => re.test(el.dataset.name));
   el.textContent = match ? match[1] : '🍽️';
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// REAL-TIME CART REFRESH - Auto-refresh cart every 5 seconds
+// ═══════════════════════════════════════════════════════════════════════
+const cartRefreshInterval = setInterval(function() {
+  const urlParams = new URLSearchParams(window.location.search);
+  const table = urlParams.get('table');
+  
+  if (!table) return;
+  
+  // Fetch the updated cart
+  fetch(`/cart?table=${encodeURIComponent(table)}`)
+    .then(response => response.text())
+    .then(html => {
+      // Extract cart data from response
+      const tempDiv = document.createElement('div');
+      tempDiv.innerHTML = html;
+      
+      // Get cart content from both documents
+      const currentCartList = document.querySelector('.cart-list');
+      const newCartList = tempDiv.querySelector('.cart-list');
+      const currentBillCard = document.querySelector('.bill-card');
+      const newBillCard = tempDiv.querySelector('.bill-card');
+      const currentEmptyState = document.querySelector('.empty-state');
+      const newEmptyState = tempDiv.querySelector('.empty-state');
+      
+      // Compare cart contents
+      let currentHTML = (currentCartList?.innerHTML || '') + (currentBillCard?.innerHTML || '') + (currentEmptyState?.innerHTML || '');
+      let newHTML = (newCartList?.innerHTML || '') + (newBillCard?.innerHTML || '') + (newEmptyState?.innerHTML || '');
+      
+      // Only update if content changed
+      if (currentHTML !== newHTML) {
+        // Update cart list
+        if (newCartList && currentCartList) {
+          currentCartList.innerHTML = newCartList.innerHTML;
+        }
+        
+        // Update bill card
+        if (newBillCard && currentBillCard) {
+          currentBillCard.innerHTML = newBillCard.innerHTML;
+        }
+        
+        // Update empty state
+        if (newEmptyState && currentEmptyState) {
+          currentEmptyState.innerHTML = newEmptyState.innerHTML;
+        }
+        
+        // Update cart count
+        const newCount = tempDiv.querySelector('.cart-count');
+        const currentCount = document.querySelector('.cart-count');
+        if (newCount && currentCount) {
+          currentCount.innerHTML = newCount.innerHTML;
+        }
+        
+        // Update action bar
+        const newActionBar = tempDiv.querySelector('.action-bar');
+        const currentActionBar = document.querySelector('.action-bar');
+        if (newActionBar && currentActionBar) {
+          currentActionBar.innerHTML = newActionBar.innerHTML;
+        }
+        
+        // Re-apply emoji mapping
+        document.querySelectorAll('.card-emoji[data-name]').forEach(el => {
+          const match = EMOJI_MAP.find(([re]) => re.test(el.dataset.name));
+          el.textContent = match ? match[1] : '🍽️';
+        });
+        
+        // Show a subtle refresh indicator
+        console.log('🔄 Cart updated in real-time');
+      }
+    })
+    .catch(error => {
+      console.log('Cart auto-refresh check completed');
+    });
+}, 5000); // Refresh every 5 seconds
+
+// Cleanup on page unload
+window.addEventListener('beforeunload', function() {
+  clearInterval(cartRefreshInterval);
+});
 </script>
 
 </body>

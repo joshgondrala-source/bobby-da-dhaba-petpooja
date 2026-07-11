@@ -11,7 +11,7 @@
         :root {
             --bg: #f6ebd8;
             --bg2: #e8d8b8;
-            --paper: #fffdf8;
+            --paper: #fffdf8; 
             --brand: #5c1010;
             --brand-dark: #3d0808;
             --gold: #c8881e;
@@ -192,5 +192,57 @@
     {% else %}
         <div class="empty-state">No billing requests at the moment.</div>
     {% endif %}
+
+    <script>
+        // ═══════════════════════════════════════════════════════════════════════
+        // REAL-TIME MANAGER DASHBOARD REFRESH
+        // Auto-refresh manager dashboard every 8 seconds to check for new requests
+        // ═══════════════════════════════════════════════════════════════════════
+        
+        const managerRefreshInterval = setInterval(function() {
+            // Fetch the updated manager page
+            fetch(window.location.href)
+                .then(response => response.text())
+                .then(html => {
+                    const tempDiv = document.createElement('div');
+                    tempDiv.innerHTML = html;
+                    
+                    // Get current and new state
+                    const currentCards = document.querySelectorAll('.card');
+                    const newCards = tempDiv.querySelectorAll('.card');
+                    
+                    // If number of cards changed, there are new requests
+                    if (currentCards.length !== newCards.length || 
+                        document.querySelector('.empty-state') !== null && 
+                        tempDiv.querySelector('.empty-state') === null) {
+                        // State has changed - reload the page
+                        location.reload();
+                    } else {
+                        // Check if any order content changed
+                        let currentState = '';
+                        currentCards.forEach(card => {
+                            currentState += card.innerHTML;
+                        });
+                        
+                        let newState = '';
+                        newCards.forEach(card => {
+                            newState += card.innerHTML;
+                        });
+                        
+                        if (currentState !== newState) {
+                            location.reload();
+                        }
+                    }
+                })
+                .catch(error => {
+                    console.log('Manager dashboard refresh check completed');
+                });
+        }, 8000); // Refresh every 8 seconds
+        
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', function() {
+            clearInterval(managerRefreshInterval);
+        });
+    </script>
 </body>
 </html>
