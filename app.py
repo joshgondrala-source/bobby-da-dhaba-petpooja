@@ -710,7 +710,7 @@ def kitchen():
             FROM kots k
             INNER JOIN tables t ON t.id = k.table_id
             WHERE k.payment_status = 'UNPAID'
-            ORDER BY k.id ASC
+            ORDER BY k.id DESC
             """
         ).fetchall()
 
