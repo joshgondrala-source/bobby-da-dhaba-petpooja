@@ -50,7 +50,7 @@ body {
   background-attachment: fixed;
   max-width: 500px;
   margin-inline: auto;
-  padding: 0 14px calc(env(safe-area-inset-bottom, 0px) + 48px);
+  padding: 0 14px calc(env(safe-area-inset-bottom, 0px) + 120px);
 }
 
 /* ─── TOP BAR ─── */
@@ -364,23 +364,6 @@ body {
 .cat-card.feature .badge { background: var(--gold); color: #3a2002; }
 .cat-card.feature .arrow-btn { background: var(--gold); color: #3a2002; }
 .cat-card.feature:active { border-color: var(--gold); }
-/* CART FAB — paste inside <style> on every page */
-.cart-fab {
-  position: fixed;
-  bottom: calc(env(safe-area-inset-bottom, 0px) + 22px);
-  right: 22px;
-  z-index: 50;
-  width: 62px; height: 62px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, #7a1a1a 0%, #3d0808 100%);
-  color: #fff8f0;
-  font-size: 26px;
-  display: inline-flex; align-items: center; justify-content: center;
-  text-decoration: none;
-  box-shadow: 0 8px 24px rgba(92,16,16,.55), 0 0 0 3px #c8881e;
-  transition: transform .15s ease;
-}
-.cart-fab:active { transform: scale(.91); }
 
 /* ─── FOOTER ─── */
 .foot-note {
@@ -394,10 +377,6 @@ body {
 .foot-note b { color: var(--gold); font-weight: 800; }
 </style>
 </head>
-<!-- CART FAB — paste just before </body> on every page -->
-<a href="/cart?table={{ table }}" class="cart-fab" aria-label="View Cart">
-  🛒
-</a>
 <body>
 
 <!-- TOP BAR -->
@@ -542,6 +521,8 @@ body {
 </main>
 
 <p class="foot-note">Made with <b>♦</b> for food lovers</p>
+
+{% include "_customer_nav.html" %}
 
 </body>
 </html>

@@ -46,7 +46,7 @@ body {
   background-attachment: fixed;
   max-width: 500px;
   margin-inline: auto;
-  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 110px);
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 220px);
 }
 
 /* ── HEADER ── */
@@ -300,96 +300,107 @@ textarea:focus {
   box-shadow: 0 0 0 3px rgba(200,136,30,.15);
 }
 
-/* ── QUANTITY ── */
-.qty-row {
-  display: flex; align-items: center; gap: 0;
-  background: var(--bg);
-  border: 1.5px solid var(--line);
-  border-radius: 999px;
+/* ── STICKY ORDER BAR ── */
+.sticky-order-bar {
+  position: fixed;
+  left: 50%;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 100px);
+  transform: translateX(-50%);
+  width: min(calc(100% - 24px), 500px);
+  min-height: 68px;
+  display: grid;
+  grid-template-columns: 1fr 1.25fr;
+  background: linear-gradient(135deg, #184530 0%, #0d2d20 100%);
+  color: #fff;
+  border-radius: 22px 22px 0 0;
+  box-shadow: 0 -14px 30px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.07);
   overflow: hidden;
-  width: fit-content;
+  z-index: 75;
 }
-.qty-btn {
-  width: 52px; height: 52px;
-  background: none; border: none;
-  color: var(--brand);
-  font-size: 26px; font-weight: 900;
-  cursor: pointer; font-family: inherit;
-  display: flex; align-items: center; justify-content: center;
-  transition: background .12s;
-  flex-shrink: 0;
+
+.sticky-qty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  border-right: 1px solid rgba(255,255,255,.12);
+  background: rgba(255,255,255,.03);
 }
-.qty-btn:active { background: var(--gold-soft); }
-.qty-display {
-  min-width: 52px;
+
+.sticky-qty-btn {
+  width: 50px;
+  height: 68px;
+  border: none;
+  background: transparent;
+  color: #fff;
+  font-size: 30px;
+  font-weight: 900;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background .15s ease, transform .15s ease;
+}
+
+.sticky-qty-btn:active {
+  background: rgba(255,255,255,.1);
+  transform: scale(.96);
+}
+
+.sticky-qty-display {
+  min-width: 44px;
   text-align: center;
   font-family: 'Fraunces', serif;
-  font-size: 24px; font-weight: 900;
-  color: var(--ink);
-  border: none;
-  background: none;
-  outline: none;
-  /* hide spinners */
-  appearance:textfield;
-  -moz-appearance:textfield;
+  font-size: 22px;
+  font-weight: 900;
+  letter-spacing: -.4px;
 }
-.qty-display::-webkit-inner-spin-button,
-.qty-display::-webkit-outer-spin-button { -webkit-appearance: none; }
-.qty-sep { width: 1px; height: 28px; background: var(--line); flex-shrink: 0; }
 
-/* ── ADD TO CART BUTTON ── */
-.cart-btn {
-  position: fixed;
-  bottom: calc(env(safe-area-inset-bottom, 0px) + 18px);
-  left: 50%; transform: translateX(-50%);
-  width: min(calc(100% - 28px), 360px);
-  height: 64px;
-  border: none; border-radius: 999px;
-  background: linear-gradient(135deg, var(--brand2) 0%, var(--brand-dark) 100%);
-  color: var(--brand-text);
-  font-family: 'Fraunces', serif;
-  font-size: 20px; font-weight: 900;
-  letter-spacing: .3px;
-  cursor: pointer;
-  box-shadow: 0 12px 32px rgba(92,16,16,.5);
-  display: flex; align-items: center; justify-content: center; gap: 12px;
-  transition: transform .15s, background .15s;
-  z-index: 40;
-  border-top: 1px solid rgba(255,255,255,.1);
-}
-.cart-btn:active { transform: translateX(-50%) scale(.97); background: linear-gradient(135deg, var(--brand) 0%, var(--brand-dark) 100%); }
-.cart-btn .btn-icon { font-size: 24px; }
-.cart-btn .btn-price {
-  font-size: 14px; font-weight: 700;
-  opacity: .8; margin-left: 4px;
+.sticky-add-btn {
+  border: none;
+  background: linear-gradient(135deg, #2f6e4a 0%, #1f4f37 100%);
+  color: #fff;
   font-family: 'Inter', sans-serif;
-}/* CART FAB — paste inside <style> on every page */
-.cart-fab {
-  position: fixed;
-  bottom: calc(env(safe-area-inset-bottom, 0px) + 22px);
-  right: 22px;
-  z-index: 50;
-  width: 62px; height: 62px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, #7a1a1a 0%, #3d0808 100%);
-  color: #fff8f0;
-  font-size: 26px;
-  display: inline-flex; align-items: center; justify-content: center;
-  text-decoration: none;
-  box-shadow: 0 8px 24px rgba(92,16,16,.55), 0 0 0 3px #c8881e;
-  transition: transform .15s ease;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: .2px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: transform .15s ease, filter .15s ease;
 }
-.cart-fab:active { transform: scale(.91); }
+
+.sticky-add-btn:active {
+  transform: scale(.985);
+  filter: brightness(1.08);
+}
+
+.sticky-add-btn .btn-icon {
+  font-size: 18px;
+}
+
+@media (max-width: 420px) {
+  .sticky-order-bar {
+    width: calc(100% - 16px);
+    min-height: 66px;
+  }
+
+  .sticky-qty-btn {
+    width: 46px;
+    height: 66px;
+    font-size: 28px;
+  }
+
+  .sticky-add-btn {
+    font-size: 15px;
+  }
+}
 
 /* hidden real input for form submit */
 input[type="hidden"] { display: none; }
 input[type="number"]#qty-real { display: none; }
 </style>
 </head>
-<!-- CART FAB — paste just before </body> on every page -->
-<a href="/cart?table={{ table }}" class="cart-fab" aria-label="View Cart">
-  🛒
-</a>
 <body>
 
 <!-- HEADER -->
@@ -480,34 +491,20 @@ input[type="number"]#qty-real { display: none; }
     </div>
   </div>
 
-  <!-- Quantity -->
-  <div class="section">
-    <div class="section-head">
-      <div class="section-icon">🔢</div>
-      <div>
-        <div class="section-title">Quantity</div>
-        <div class="section-sub">How many plates?</div>
-      </div>
-    </div>
-    <div class="section-body">
-      <div class="qty-row">
-        <button type="button" class="qty-btn" id="qty-minus">−</button>
-        <span class="qty-sep"></span>
-        <input class="qty-display" id="qty-display" type="number" value="1" min="1" readonly>
-        <span class="qty-sep"></span>
-        <button type="button" class="qty-btn" id="qty-plus">+</button>
-      </div>
-    </div>
-  </div>
-
 </form>
 
-<!-- ADD TO CART BUTTON -->
-<button class="cart-btn" id="cart-btn" type="button">
-  <span class="btn-icon">🛒</span>
-  Add to Cart
-  <span class="btn-price" id="btn-price">· ₹{{ item.price }}</span>
-</button>
+<!-- STICKY ORDER BAR -->
+<div class="sticky-order-bar">
+  <div class="sticky-qty">
+    <button type="button" class="sticky-qty-btn" id="qty-minus" aria-label="Decrease quantity">−</button>
+    <span class="sticky-qty-display" id="qty-display">1</span>
+    <button type="button" class="sticky-qty-btn" id="qty-plus" aria-label="Increase quantity">+</button>
+  </div>
+  <button class="sticky-add-btn" id="cart-btn" type="submit" form="order-form">
+    <span class="btn-icon">🛒</span>
+    Add to Cart
+  </button>
+</div>
 
 <script>
 /* ── Emoji mapper ── */
@@ -579,29 +576,27 @@ function syncInstructions() {
 
 /* ── Quantity ── */
 let qty = 1;
-const basePrice = parseInt("{{ item.price }}");
 const qtyDisplay = document.getElementById('qty-display');
 const qtyReal    = document.getElementById('qty-real');
-const btnPrice   = document.getElementById('btn-price');
 
 function updateQty(n) {
   qty = Math.max(1, n);
-  qtyDisplay.value = qty;
+  qtyDisplay.textContent = qty;
   qtyReal.value    = qty;
-  btnPrice.textContent = '· ₹' + (basePrice * qty);
 }
 document.getElementById('qty-minus').addEventListener('click', () => updateQty(qty - 1));
 document.getElementById('qty-plus').addEventListener('click',  () => updateQty(qty + 1));
 
 /* ── Submit ── */
-document.getElementById('cart-btn').addEventListener('click', () => {
+document.getElementById('order-form').addEventListener('submit', () => {
   // sync instructions one last time
   const active = [...document.querySelectorAll('.chip.active')].map(c => c.dataset.val);
   const combined = [...active, manualText].filter(Boolean).join(', ');
   document.getElementById('instructions-hidden').value = combined;
-  document.getElementById('order-form').submit();
 });
 </script>
+
+{% include "_customer_nav.html" %}
 
 </body>
 </html>

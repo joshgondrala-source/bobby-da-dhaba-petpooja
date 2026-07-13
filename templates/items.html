@@ -324,24 +324,6 @@ body {
   font-size: 9.5px; font-weight: 800;
   text-transform: uppercase; letter-spacing: 1px;
 }
-/* CART FAB — paste inside <style> on every page */
-.cart-fab {
-  position: fixed;
-  bottom: calc(env(safe-area-inset-bottom, 0px) + 22px);
-  right: 22px;
-  z-index: 50;
-  width: 62px; height: 62px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, #7a1a1a 0%, #3d0808 100%);
-  color: #fff8f0;
-  font-size: 26px;
-  display: inline-flex; align-items: center; justify-content: center;
-  text-decoration: none;
-  box-shadow: 0 8px 24px rgba(92,16,16,.55), 0 0 0 3px #c8881e;
-  transition: transform .15s ease;
-}
-.cart-fab:active { transform: scale(.91); }
-
 /* ── FOOTER ── */
 .foot-note {
   text-align: center;
@@ -354,10 +336,6 @@ body {
 .foot-note b { color: var(--gold); font-weight: 800; }
 </style>
 </head>
-<!-- CART FAB — paste just before </body> on every page -->
-<a href="/cart?table={{ table }}" class="cart-fab" aria-label="View Cart">
-  🛒
-</a>
 <body>
 
 <!-- HEADER -->
@@ -455,6 +433,8 @@ document.querySelectorAll('.dish-icon[data-name]').forEach(el => {
   el.textContent = match ? match[1] : '🍽️';
 });
 </script>
+
+{% include "_customer_nav.html" %}
 
 </body>
 </html>

@@ -71,6 +71,10 @@ def init_db():
         )
         conn.commit()
 
+        def format_table_timestamp(value):
+            if not value:
+                return ""
+
 
 init_db()
 
@@ -95,6 +99,7 @@ def get_or_create_table_id(table_number):
             (table_key,)
         )
         conn.commit()
+
         return cursor.lastrowid
 
 
@@ -121,6 +126,7 @@ def get_table_cart_items(table_id):
         rows = conn.execute(
             """
             SELECT
+                id,
                 item_name AS name,
                 unit_price AS price,
                 quantity,
@@ -133,6 +139,122 @@ def get_table_cart_items(table_id):
         ).fetchall()
 
     return [dict(row) for row in rows]
+
+
+def format_table_timestamp(value):
+    if not value:
+        return ""
+
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").strftime("%d %b %Y, %I:%M %p")
+    except (ValueError, TypeError):
+        return value
+
+
+def get_table_order_history(table_id):
+    with get_db_connection() as conn:
+        kot_rows = conn.execute(
+            """
+            SELECT
+                k.id,
+                k.kot_number,
+                k.kot_type,
+                k.payment_status,
+                k.created_at,
+                COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS total
+            FROM kots k
+            LEFT JOIN kot_items ki ON ki.kot_id = k.id
+            WHERE k.table_id = ?
+            GROUP BY k.id, k.kot_number, k.kot_type, k.payment_status, k.created_at
+            ORDER BY k.id ASC
+            """,
+            (table_id,)
+        ).fetchall()
+
+        orders = []
+
+        for kot in kot_rows:
+            item_rows = conn.execute(
+                """
+                SELECT item_name, quantity, COALESCE(instructions, '') AS instructions
+                FROM kot_items
+                WHERE kot_id = ?
+                ORDER BY id ASC
+                """,
+                (kot["id"],)
+            ).fetchall()
+
+            orders.append({
+                "order_id": kot["kot_number"],
+                "order_type": kot["kot_type"],
+                "payment_status": kot["payment_status"],
+                "time": format_table_timestamp(kot["created_at"]),
+                "total": float(kot["total"]),
+                "items": [
+                    {
+                        "name": item["item_name"],
+                        "quantity": item["quantity"],
+                        "instructions": item["instructions"]
+                    }
+                    for item in item_rows
+                ]
+            })
+
+    return orders
+
+
+def get_table_bill_summary(table_id):
+    with get_db_connection() as conn:
+        unpaid_rows = conn.execute(
+            """
+            SELECT
+                k.id,
+                k.kot_number,
+                k.kot_type,
+                k.created_at,
+                COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS total
+            FROM kots k
+            LEFT JOIN kot_items ki ON ki.kot_id = k.id
+            WHERE k.table_id = ? AND k.payment_status = 'UNPAID'
+            GROUP BY k.id, k.kot_number, k.kot_type, k.created_at
+            ORDER BY k.id ASC
+            """,
+            (table_id,)
+        ).fetchall()
+
+        bill_request_row = conn.execute(
+            """
+            SELECT requested_at
+            FROM bill_requests
+            WHERE table_id = ? AND is_active = 1
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (table_id,)
+        ).fetchone()
+
+    orders = [
+        {
+            "order_id": row["kot_number"],
+            "order_type": row["kot_type"],
+            "time": format_table_timestamp(row["created_at"]),
+            "total": float(row["total"])
+        }
+        for row in unpaid_rows
+    ]
+
+    food_total = sum(order["total"] for order in orders)
+    gst = round(food_total * 0.05, 2)
+    grand_total = round(food_total + gst, 2)
+
+    return {
+        "orders": orders,
+        "food_total": food_total,
+        "gst": gst,
+        "grand_total": grand_total,
+        "bill_requested": bill_request_row is not None,
+        "requested_at": format_table_timestamp(bill_request_row["requested_at"]) if bill_request_row else None,
+    }
 
 current_table=None
 
@@ -454,12 +576,13 @@ def menu():
 
     return render_template(
         "menu.html",
-        table=current_table
+        table=current_table,
+        nav_active="menu"
     )
+
 
 @app.route("/items")
 def items():
-
     table = request.args.get("table")
     category = request.args.get("category")
 
@@ -467,21 +590,19 @@ def items():
         "items.html",
         table=table,
         category=category,
-        items=restaurant_menu[category]
+        items=restaurant_menu[category],
+        nav_active="menu"
     )
 
 
 @app.route("/itemdetails")
 def itemdetails():
-
     name = request.args.get("name")
 
     item_data = None
 
     for category in restaurant_menu.values():
-
         for item in category:
-
             if item["name"] == name:
                 item_data = item
                 break
@@ -489,11 +610,13 @@ def itemdetails():
     table = request.args.get("table")
 
     return render_template(
-     "item_details.html",
-     item=item_data,
-     table=table
-)
-    
+        "item_details.html",
+        item=item_data,
+        table=table,
+        nav_active="menu"
+    )
+
+
 @app.route("/addtocart", methods=["POST"])
 def addtocart():
     table = request.form.get("table")
@@ -518,14 +641,17 @@ def addtocart():
     grand_total = 0
 
     for item in table_cart:
-      grand_total += item["price"] * item["quantity"]
+        grand_total += item["price"] * item["quantity"]
 
     return render_template(
-     "cart.html",
-     cart=table_cart,
-     grand_total=grand_total,
-     table=table
+        "cart.html",
+        cart=table_cart,
+        grand_total=grand_total,
+        table=table,
+        nav_active="cart"
     )
+
+
 @app.route("/cart")
 def showcart():
     table = resolve_table_value()
@@ -545,8 +671,11 @@ def showcart():
         "cart.html",
         cart=table_cart,
         grand_total=grand_total,
-        table=table
+        table=table,
+        nav_active="cart"
     )
+
+
 @app.route("/deleteitem", methods=["POST"])
 def deleteitem():
     item_name = request.form.get("item_name")
@@ -578,14 +707,66 @@ def deleteitem():
     grand_total = 0
 
     for item in table_cart:
-      grand_total += item["price"] * item["quantity"]
+        grand_total += item["price"] * item["quantity"]
 
     return render_template(
         "cart.html",
         cart=table_cart,
         grand_total=grand_total,
-        table=table
+        table=table,
+        nav_active="cart"
     )
+
+
+@app.route("/updatecartqty", methods=["POST"])
+def updatecartqty():
+    table = resolve_table_value()
+    item_id = request.form.get("item_id")
+    action = request.form.get("action")
+
+    table_cart = []
+
+    if table and item_id and action in ("inc", "dec"):
+        table_id = get_or_create_table_id(table)
+
+        with get_db_connection() as conn:
+            if action == "inc":
+                conn.execute(
+                    """
+                    UPDATE table_cart_items
+                    SET quantity = quantity + 1
+                    WHERE id = ? AND table_id = ?
+                    """,
+                    (item_id, table_id)
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE table_cart_items
+                    SET quantity = quantity - 1
+                    WHERE id = ? AND table_id = ? AND quantity > 1
+                    """,
+                    (item_id, table_id)
+                )
+
+            conn.commit()
+
+        table_cart = get_table_cart_items(table_id)
+
+    grand_total = 0
+
+    for item in table_cart:
+        grand_total += item["price"] * item["quantity"]
+
+    return render_template(
+        "cart.html",
+        cart=table_cart,
+        grand_total=grand_total,
+        table=table,
+        nav_active="cart"
+    )
+
+
 @app.route("/placeorder", methods=["POST"])
 def placeorder():
     table = resolve_table_value()
@@ -683,10 +864,13 @@ def placeorder():
 
     table_orders = [dict(row) for row in table_orders_rows]
 
-    table_total = 0
+    table_food_total = 0
 
     for order in table_orders:
-        table_total += order["total"]
+        table_food_total += order["total"]
+
+    table_gst = round(table_food_total * 0.05, 2)
+    table_total_with_gst = round(table_food_total + table_gst, 2)
 
     return render_template(
         "order_success.html",
@@ -694,8 +878,54 @@ def placeorder():
         table=table,
         total=total,
         table_orders=table_orders,
-        table_total=table_total
+        table_food_total=table_food_total,
+        table_gst=table_gst,
+        table_total_with_gst=table_total_with_gst
     )
+
+
+@app.route("/orders")
+def orders():
+    table = resolve_table_value()
+
+    if not table:
+        return redirect("/menu")
+
+    table_id = get_or_create_table_id(table)
+    order_history = get_table_order_history(table_id)
+
+    return render_template(
+        "orders.html",
+        table=table,
+        orders=order_history,
+        order_count=len(order_history),
+        nav_active="orders"
+    )
+
+
+@app.route("/bill")
+def bill():
+    table = resolve_table_value()
+
+    if not table:
+        return redirect("/menu")
+
+    table_id = get_or_create_table_id(table)
+    bill_data = get_table_bill_summary(table_id)
+
+    return render_template(
+        "bill.html",
+        table=table,
+        orders=bill_data["orders"],
+        food_total=bill_data["food_total"],
+        gst=bill_data["gst"],
+        grand_total=bill_data["grand_total"],
+        bill_requested=bill_data["bill_requested"],
+        requested_at=bill_data["requested_at"],
+        nav_active="bill"
+    )
+
+
 @app.route("/kitchen")
 def kitchen():
     with get_db_connection() as conn:

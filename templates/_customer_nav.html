@@ -1,0 +1,112 @@
+<style>
+.customer-bottom-nav {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 0;
+  width: min(100%, 500px);
+  z-index: 80;
+  padding: 10px 10px calc(env(safe-area-inset-bottom, 0px) + 12px);
+  background: linear-gradient(180deg, rgba(12, 50, 31, .78) 0%, rgba(9, 29, 18, .96) 100%);
+  border-top-left-radius: 24px;
+  border-top-right-radius: 24px;
+  box-shadow: 0 -16px 36px rgba(0, 0, 0, .32), inset 0 1px 0 rgba(255, 255, 255, .04);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.customer-bottom-nav__inner {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.customer-nav-item {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 58px;
+  padding: 8px 6px;
+  border-radius: 18px;
+  color: rgba(236, 245, 238, .76);
+  text-decoration: none;
+  font-family: inherit;
+  font-weight: 700;
+  letter-spacing: .2px;
+  transition: transform .16s ease, background .16s ease, color .16s ease, box-shadow .16s ease;
+}
+
+.customer-nav-item:active,
+.customer-nav-item:hover {
+  transform: translateY(-2px);
+  background: rgba(255, 255, 255, .04);
+  color: #ffffff;
+}
+
+.customer-nav-item.is-active {
+  color: #ffffff;
+  background: linear-gradient(180deg, rgba(58, 111, 74, .98) 0%, rgba(18, 58, 35, .98) 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .09), 0 10px 18px rgba(0, 0, 0, .18);
+  transform: translateY(-2px);
+}
+
+.customer-nav-icon {
+  font-size: 22px;
+  line-height: 1;
+}
+
+.customer-nav-label {
+  font-size: 11px;
+  line-height: 1;
+  text-align: center;
+  white-space: nowrap;
+}
+
+@media (max-width: 380px) {
+  .customer-bottom-nav {
+    padding-inline: 8px;
+  }
+
+  .customer-bottom-nav__inner {
+    gap: 6px;
+  }
+
+  .customer-nav-item {
+    min-height: 54px;
+    padding-inline: 4px;
+  }
+
+  .customer-nav-icon {
+    font-size: 20px;
+  }
+
+  .customer-nav-label {
+    font-size: 10px;
+  }
+}
+</style>
+
+{% set nav_table = table if table else '' %}
+<nav class="customer-bottom-nav" aria-label="Customer navigation">
+  <div class="customer-bottom-nav__inner">
+    <a class="customer-nav-item {% if nav_active == 'menu' %}is-active{% endif %}" href="{{ '/menu' ~ ('?table=' ~ nav_table if nav_table else '') }}">
+      <span class="customer-nav-icon">🍽</span>
+      <span class="customer-nav-label">Menu</span>
+    </a>
+    <a class="customer-nav-item {% if nav_active == 'cart' %}is-active{% endif %}" href="{{ '/cart' ~ ('?table=' ~ nav_table if nav_table else '') }}">
+      <span class="customer-nav-icon">🛒</span>
+      <span class="customer-nav-label">Cart</span>
+    </a>
+    <a class="customer-nav-item {% if nav_active == 'orders' %}is-active{% endif %}" href="{{ '/orders' ~ ('?table=' ~ nav_table if nav_table else '') }}">
+      <span class="customer-nav-icon">⏱</span>
+      <span class="customer-nav-label">Orders</span>
+    </a>
+    <a class="customer-nav-item {% if nav_active == 'bill' %}is-active{% endif %}" href="{{ '/bill' ~ ('?table=' ~ nav_table if nav_table else '') }}">
+      <span class="customer-nav-icon">🧾</span>
+      <span class="customer-nav-label">Bill</span>
+    </a>
+  </div>
+</nav>

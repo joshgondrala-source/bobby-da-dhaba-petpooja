@@ -48,7 +48,7 @@ body {
   background-attachment: fixed;
   max-width: 500px;
   margin-inline: auto;
-  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 160px);
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 220px);
 }
 
 /* ── HEADER ── */
@@ -217,7 +217,40 @@ body {
 .card-foot {
   margin-top: 14px; padding-top: 12px;
   border-top: 1px solid var(--line);
-  display: flex; justify-content: flex-end;
+  display: flex; justify-content: space-between; align-items: center; gap: 10px;
+}
+.qty-controls {
+  display: inline-flex; align-items: center; gap: 0;
+  background: var(--bg);
+  border: 1.5px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.qty-btn {
+  width: 40px; height: 40px;
+  background: none;
+  border: none;
+  color: var(--brand);
+  font-size: 22px;
+  line-height: 1;
+  font-weight: 900;
+  cursor: pointer;
+  font-family: inherit;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.qty-btn:active { background: var(--gold-soft); }
+.qty-val {
+  min-width: 38px;
+  text-align: center;
+  font-family: 'Fraunces', serif;
+  font-size: 20px;
+  font-weight: 900;
+  color: var(--ink);
+}
+.qty-sep {
+  width: 1px;
+  height: 22px;
+  background: var(--line);
 }
 .delete-btn {
   display: inline-flex; align-items: center; gap: 6px;
@@ -276,12 +309,21 @@ body {
 /* ── BOTTOM ACTION BAR ── */
 .action-bar {
   position: fixed;
-  bottom: 0; left: 50%; transform: translateX(-50%);
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 102px); left: 50%; transform: translateX(-50%);
   width: min(100%, 500px);
   padding: 12px 14px calc(env(safe-area-inset-bottom, 0px) + 14px);
   background: linear-gradient(to top, var(--bg2) 60%, transparent);
-  display: flex; flex-direction: column; gap: 10px;
+  display: grid; gap: 10px;
+  grid-template-columns: 1fr;
   z-index: 40;
+}
+
+.action-bar.has-cart {
+  grid-template-columns: 1fr 1fr;
+}
+
+.action-bar .action-form {
+  margin: 0;
 }
 
 .btn-place {
@@ -357,7 +399,7 @@ body {
         <div class="card-emoji" data-name="{{ item.name }}">🍽️</div>
         <div class="card-info">
           <div class="card-name">{{ item.name }}</div>
-          <div class="card-qty">Qty: {{ item.quantity }}</div>
+          <div class="card-qty">Quantity</div>
         </div>
         <div class="card-price">₹{{ item.price * item.quantity }}</div>
       </div>
@@ -370,8 +412,26 @@ body {
       {% endif %}
 
       <div class="card-foot">
+        <div class="qty-controls">
+          <form action="/updatecartqty" method="POST">
+            <input type="hidden" name="item_id" value="{{ item.id }}">
+            <input type="hidden" name="action" value="dec">
+            <input type="hidden" name="table" value="{{ table }}">
+            <button type="submit" class="qty-btn" aria-label="Decrease quantity">−</button>
+          </form>
+          <span class="qty-sep"></span>
+          <span class="qty-val">{{ item.quantity }}</span>
+          <span class="qty-sep"></span>
+          <form action="/updatecartqty" method="POST">
+            <input type="hidden" name="item_id" value="{{ item.id }}">
+            <input type="hidden" name="action" value="inc">
+            <input type="hidden" name="table" value="{{ table }}">
+            <button type="submit" class="qty-btn" aria-label="Increase quantity">+</button>
+          </form>
+        </div>
         <form action="/deleteitem" method="POST">
           <input type="hidden" name="item_name" value="{{ item.name }}">
+          <input type="hidden" name="table" value="{{ table }}">
           <button type="submit" class="delete-btn">
             🗑️ Remove
           </button>
@@ -414,12 +474,12 @@ body {
 {% endif %}
 
 <!-- BOTTOM ACTION BAR -->
-<div class="action-bar">
+<div class="action-bar {% if cart %}has-cart{% endif %}">
   <a href="/menu?table={{ table }}" class="btn-add">
     ＋ Add More Items
   </a>
   {% if cart %}
-  <form action="/placeorder" method="POST">
+  <form action="/placeorder" method="POST" class="action-form">
     <button type="submit" class="btn-place">
       <span class="btn-icon">✅</span>
       Place Order · ₹{{ grand_total }}
@@ -528,6 +588,8 @@ window.addEventListener('beforeunload', function() {
   clearInterval(cartRefreshInterval);
 });
 </script>
+
+{% include "_customer_nav.html" %}
 
 </body>
 </html>

@@ -402,31 +402,19 @@ Current Order
 
     </div>
 
-    <div style="text-align:center;margin-top:10px;">
+    <div class="row">
+        <div class="label">Food Total</div>
+        <div class="value">₹{{ table_food_total }}</div>
+    </div>
 
-        <div
-        style="
-        font-size:42px;
-        font-weight:900;
-        color:var(--brand);
-        font-family:'Fraunces',serif;
-        ">
+    <div class="row">
+        <div class="label">GST (5%)</div>
+        <div class="value">₹{{ table_gst|round(2) }}</div>
+    </div>
 
-            ₹{{ table_total }}
-
-        </div>
-
-        <div
-        style="
-        color:var(--muted);
-        margin-top:8px;
-        font-size:15px;
-        ">
-
-            Total amount ordered at this table
-
-        </div>
-
+    <div class="row">
+        <div class="label" style="font-weight:800;color:var(--brand-dark);">Payable Total</div>
+        <div class="value total">₹{{ table_total_with_gst|round(2) }}</div>
     </div>
 
 </div>
