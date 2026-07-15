@@ -1,11 +1,11 @@
-from flask import Flask, render_template, request
-from flask import redirect
+from flask import Flask, render_template, request, session, redirect, abort
 from datetime import datetime
 import os
 import sqlite3
 from urllib.parse import parse_qs, urlparse
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-in-production")
 DB_PATH = os.path.join(app.root_path, "restaurant.db")
 
 
@@ -67,13 +67,31 @@ def init_db():
                 is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
                 FOREIGN KEY (table_id) REFERENCES tables(id)
             );
+
+            CREATE TABLE IF NOT EXISTS bills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_id INTEGER NOT NULL,
+                food_total REAL NOT NULL,
+                gst REAL NOT NULL,
+                discount_percent REAL NOT NULL DEFAULT 0,
+                discount_amount REAL NOT NULL DEFAULT 0,
+                final_total REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'PAID')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                paid_at TEXT,
+                FOREIGN KEY (table_id) REFERENCES tables(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS counters (
+                name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL DEFAULT 0
+            );
             """
         )
+        conn.execute(
+            "INSERT OR IGNORE INTO counters (name, value) VALUES ('takeaway_token', 0)"
+        )
         conn.commit()
-
-        def format_table_timestamp(value):
-            if not value:
-                return ""
 
 
 init_db()
@@ -116,9 +134,16 @@ def resolve_table_value():
             table = table_from_ref
 
     if not table:
-        table = current_table
+        # Per-browser fallback (session cookie) instead of a shared global,
+        # so one customer's table never leaks into another customer's session.
+        table = session.get("table")
 
-    return (table or "").strip() or None
+    table = (table or "").strip() or None
+
+    if table:
+        session["table"] = table
+
+    return table
 
 
 def get_table_cart_items(table_id):
@@ -165,6 +190,11 @@ def get_table_order_history(table_id):
             FROM kots k
             LEFT JOIN kot_items ki ON ki.kot_id = k.id
             WHERE k.table_id = ?
+              AND k.created_at >= (
+                  SELECT COALESCE(occupied_since, '9999-12-31 23:59:59')
+                  FROM tables
+                  WHERE id = k.table_id
+              )
             GROUP BY k.id, k.kot_number, k.kot_type, k.payment_status, k.created_at
             ORDER BY k.id ASC
             """,
@@ -255,8 +285,6 @@ def get_table_bill_summary(table_id):
         "bill_requested": bill_request_row is not None,
         "requested_at": format_table_timestamp(bill_request_row["requested_at"]) if bill_request_row else None,
     }
-
-current_table=None
 
 # MENU DATA
 restaurant_menu = {
@@ -553,6 +581,20 @@ restaurant_menu = {
 
 }
 
+# Server-side price lookup (name -> price). Used to validate/derive prices
+# for every add-to-cart request so a client can never submit its own price.
+MENU_LOOKUP = {
+    item["name"]: item["price"]
+    for category_items in restaurant_menu.values()
+    for item in category_items
+}
+
+MENU_LOOKUP_ITEMS = {
+    item["name"]: item
+    for category_items in restaurant_menu.values()
+    for item in category_items
+}
+
 
 @app.route("/")
 def home():
@@ -566,17 +608,14 @@ def dinein():
 
 @app.route("/menu")
 def menu():
-    global current_table
-
     table = resolve_table_value()
 
     if table:
-        current_table = table
         get_or_create_table_id(table)
 
     return render_template(
         "menu.html",
-        table=current_table,
+        table=table,
         nav_active="menu"
     )
 
@@ -585,6 +624,9 @@ def menu():
 def items():
     table = request.args.get("table")
     category = request.args.get("category")
+
+    if category not in restaurant_menu:
+        abort(404, description="Unknown menu category")
 
     return render_template(
         "items.html",
@@ -599,15 +641,12 @@ def items():
 def itemdetails():
     name = request.args.get("name")
 
-    item_data = None
-
-    for category in restaurant_menu.values():
-        for item in category:
-            if item["name"] == name:
-                item_data = item
-                break
+    item_data = MENU_LOOKUP_ITEMS.get(name)
 
     table = request.args.get("table")
+
+    if item_data is None:
+        abort(404, description="Unknown item")
 
     return render_template(
         "item_details.html",
@@ -621,9 +660,22 @@ def itemdetails():
 def addtocart():
     table = request.form.get("table")
     item_name = request.form.get("item_name")
-    price = int(request.form.get("price"))
-    quantity = int(request.form.get("quantity"))
     instructions = request.form.get("instructions")
+
+    if item_name not in MENU_LOOKUP:
+        abort(400, description="Unknown item")
+
+    # Price is always looked up server-side from the menu — never trust the
+    # client-submitted price, otherwise a crafted request could set any price.
+    price = MENU_LOOKUP[item_name]
+
+    try:
+        quantity = int(request.form.get("quantity", ""))
+    except (TypeError, ValueError):
+        abort(400, description="Invalid quantity")
+
+    if quantity <= 0:
+        abort(400, description="Quantity must be positive")
 
     table_id = get_or_create_table_id(table)
 
@@ -880,7 +932,8 @@ def placeorder():
         table_orders=table_orders,
         table_food_total=table_food_total,
         table_gst=table_gst,
-        table_total_with_gst=table_total_with_gst
+        table_total_with_gst=table_total_with_gst,
+        nav_active="orders"
     )
 
 
@@ -1070,6 +1123,14 @@ def generatebill():
 
     table_id = get_or_create_table_id(table)
 
+    try:
+        discount = float(request.form.get("discount", 0) or 0)
+    except (TypeError, ValueError):
+        discount = 0.0
+
+    # Clamp to a sane 0-100% range regardless of what the client sends.
+    discount = max(0.0, min(discount, 100.0))
+
     with get_db_connection() as conn:
         total_row = conn.execute(
             """
@@ -1081,23 +1142,27 @@ def generatebill():
             (table_id,)
         ).fetchone()
 
-    food_total = float(total_row["food_total"])
+        food_total = float(total_row["food_total"])
+        gst = food_total * 0.05
+        subtotal = food_total + gst
+        discount_amount = subtotal * discount / 100
+        final_total = subtotal - discount_amount
+        rounded_total = round(final_total)
 
-    discount = float(request.form.get("discount", 0) or 0)
-
-    gst = food_total * 0.05
-
-    subtotal = food_total + gst
-
-    discount_amount = (
-        subtotal * discount / 100
-    )
-
-    final_total = (
-        subtotal - discount_amount
-    )
-
-    rounded_total = round(final_total)
+        # Replace any earlier pending bill for this table so /markpaid always
+        # settles using the latest discount instead of losing it.
+        conn.execute(
+            "DELETE FROM bills WHERE table_id = ? AND status = 'PENDING'",
+            (table_id,)
+        )
+        conn.execute(
+            """
+            INSERT INTO bills (table_id, food_total, gst, discount_percent, discount_amount, final_total, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'PENDING')
+            """,
+            (table_id, food_total, gst, discount, discount_amount, final_total)
+        )
+        conn.commit()
 
     return render_template(
         "final_bill.html",
@@ -1109,6 +1174,8 @@ def generatebill():
         final_total=final_total,
         rounded_total=rounded_total
     )
+
+
 @app.route("/markpaid", methods=["POST"])
 def markpaid():
     table = resolve_table_value()
@@ -1117,6 +1184,54 @@ def markpaid():
         table_id = get_or_create_table_id(table)
 
         with get_db_connection() as conn:
+            pending_bill = conn.execute(
+                """
+                SELECT id, food_total, gst, discount_percent, discount_amount, final_total
+                FROM bills
+                WHERE table_id = ? AND status = 'PENDING'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (table_id,)
+            ).fetchone()
+
+            if pending_bill:
+                # Settle using the manager's already-generated (and possibly
+                # discounted) bill instead of recomputing from scratch.
+                conn.execute(
+                    """
+                    UPDATE bills
+                    SET status = 'PAID', paid_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (pending_bill["id"],)
+                )
+            else:
+                # Manager marked paid without generating a bill first — fall
+                # back to the raw unpaid total with zero discount, but still
+                # record it so owner reporting stays accurate.
+                total_row = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS food_total
+                    FROM kots k
+                    INNER JOIN kot_items ki ON ki.kot_id = k.id
+                    WHERE k.table_id = ? AND k.payment_status = 'UNPAID'
+                    """,
+                    (table_id,)
+                ).fetchone()
+
+                food_total = float(total_row["food_total"])
+                gst = food_total * 0.05
+                final_total = food_total + gst
+
+                conn.execute(
+                    """
+                    INSERT INTO bills (table_id, food_total, gst, discount_percent, discount_amount, final_total, status, paid_at)
+                    VALUES (?, ?, ?, 0, 0, ?, 'PAID', CURRENT_TIMESTAMP)
+                    """,
+                    (table_id, food_total, gst, final_total)
+                )
+
             conn.execute(
                 """
                 UPDATE kots
@@ -1155,6 +1270,8 @@ def markpaid():
             conn.commit()
 
     return redirect("/manager")
+
+
 @app.route("/veg")
 def veg():
 
@@ -1176,16 +1293,23 @@ def nonveg():
         table=table
     )
 
-takeaway_token = 1
-
 @app.route("/takeaway")
 def takeaway():
+    # Persisted, atomic counter in SQLite instead of an in-memory global —
+    # avoids duplicate tokens under concurrent requests or after a restart.
+    with get_db_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value FROM counters WHERE name = 'takeaway_token'"
+        ).fetchone()
+        next_value = row["value"] + 1
+        conn.execute(
+            "UPDATE counters SET value = ? WHERE name = 'takeaway_token'",
+            (next_value,)
+        )
+        conn.commit()
 
-    global takeaway_token
-
-    token = f"TK{takeaway_token:03d}"
-
-    takeaway_token += 1
+    token = f"TK{next_value:03d}"
 
     return redirect(f"/menu?table={token}")
 
@@ -1193,62 +1317,71 @@ def takeaway():
 @app.route("/owner")
 def owner():
     """Owner dashboard showing today's total sales with GST"""
-    from datetime import date, datetime as dt
-    
-    today = date.today().strftime("%Y-%m-%d")
-    
+    from datetime import datetime as dt
+
+    # SQLite's CURRENT_TIMESTAMP is stored in UTC, so "today" must also be
+    # computed in UTC — comparing it against the server's local date caused
+    # bills to vanish from the dashboard once local time crossed midnight
+    # ahead of UTC (e.g. evenings in IST, UTC+5:30).
+    today = dt.utcnow().strftime("%Y-%m-%d")
+
     with get_db_connection() as conn:
-        # Get all paid orders from today
-        paid_orders = conn.execute(
+        # Revenue is reported from the `bills` table (one row per settled
+        # checkout) so any manager discount is correctly reflected — summing
+        # raw kot_items would ignore discounts and overstate revenue.
+        paid_bills = conn.execute(
             """
             SELECT
-                k.id,
-                k.kot_number,
+                b.id,
                 t.table_number,
-                k.created_at,
-                COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS food_total
-            FROM kots k
-            INNER JOIN tables t ON t.id = k.table_id
-            LEFT JOIN kot_items ki ON ki.kot_id = k.id
-            WHERE k.payment_status = 'PAID'
-            AND DATE(k.created_at) = ?
-            GROUP BY k.id, k.kot_number, t.table_number, k.created_at
-            ORDER BY k.created_at DESC
+                b.food_total,
+                b.gst,
+                b.discount_percent,
+                b.discount_amount,
+                b.final_total,
+                b.paid_at
+            FROM bills b
+            INNER JOIN tables t ON t.id = b.table_id
+            WHERE b.status = 'PAID'
+            AND DATE(b.paid_at) = ?
+            ORDER BY b.paid_at DESC
             """,
             (today,)
         ).fetchall()
-        
+
         # Calculate totals
         total_food = 0
         total_gst = 0
         total_revenue = 0
-        
+
         finalized_bills = []
-        
-        for order in paid_orders:
-            food_total = float(order["food_total"])
-            gst = food_total * 0.05
-            grand_total = food_total + gst
-            
+
+        for bill in paid_bills:
+            food_total = float(bill["food_total"])
+            gst = float(bill["gst"])
+            grand_total = float(bill["final_total"])
+
             total_food += food_total
             total_gst += gst
             total_revenue += grand_total
-            
-            time_value = order["created_at"]
+
+            time_value = bill["paid_at"]
             try:
-                time_value = dt.strptime(order["created_at"], "%Y-%m-%d %H:%M:%S").strftime("%I:%M %p")
+                time_value = dt.strptime(bill["paid_at"], "%Y-%m-%d %H:%M:%S").strftime("%I:%M %p")
             except (ValueError, TypeError):
                 pass
-            
+
             finalized_bills.append({
-                "kot_number": order["kot_number"],
-                "table": str(order["table_number"]),
+                "bill_id": bill["id"],
+                "table": str(bill["table_number"]),
                 "food_total": food_total,
                 "gst": gst,
+                "discount_percent": float(bill["discount_percent"]),
+                "discount_amount": float(bill["discount_amount"]),
                 "total": grand_total,
                 "time": time_value
             })
-    
+
     return render_template(
         "owner.html",
         total_food=total_food,
@@ -1260,4 +1393,4 @@ def owner():
 
 
 if __name__ == "__main__":
-    app.run(debug=True) 
+    app.run(debug=True)
