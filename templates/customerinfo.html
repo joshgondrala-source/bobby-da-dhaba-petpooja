@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Bobby Da Dhaba — Your Details</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#7a1f1f">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#fbf6ee;
+  --surface:#ffffff;
+  --ink:#2b211c;
+  --muted:#8a7d72;
+  --brand:#7a1f1f;
+  --brand-dark:#5e1414;
+  --accent:#d4a24c;
+  --line:rgba(43,33,28,.12);
+  --shadow:0 10px 30px rgba(43,33,28,.10);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0}
+body{
+  font-family:'Inter',system-ui,-apple-system,sans-serif;
+  background:
+    radial-gradient(1200px 600px at 50% -200px, rgba(212,162,76,.18), transparent 60%),
+    radial-gradient(800px 500px at 50% 110%, rgba(122,31,31,.10), transparent 60%),
+    var(--bg);
+  color:var(--ink);
+  min-height:100dvh;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  padding:28px 20px 40px;
+}
+.brand{text-align:center;margin-top:8px;margin-bottom:28px;}
+.brand .crest{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:72px;height:72px;border-radius:50%;
+  background:var(--brand);color:#fff;font-size:34px;
+  box-shadow:var(--shadow);border:3px solid var(--accent);margin-bottom:14px;
+}
+.brand h1{
+  font-family:'Playfair Display',serif;font-size:34px;line-height:1.05;
+  margin:0;letter-spacing:.5px;color:var(--brand-dark);
+}
+.brand .tagline{margin-top:6px;font-size:13px;letter-spacing:.32em;text-transform:uppercase;color:var(--muted);}
+.divider{display:flex;align-items:center;justify-content:center;gap:10px;margin:14px auto 0;color:var(--accent);}
+.divider .line{flex:0 0 40px;height:1px;background:var(--accent);opacity:.6}
+.card{
+  width:100%;max-width:440px;background:var(--surface);
+  border:1px solid var(--line);border-radius:22px;
+  padding:28px 22px 26px;box-shadow:var(--shadow);position:relative;
+}
+.card::before{
+  content:"";position:absolute;inset:6px;
+  border:1px dashed rgba(122,31,31,.25);border-radius:18px;pointer-events:none;
+}
+.welcome{text-align:center;margin:0 0 4px;font-family:'Playfair Display',serif;font-size:24px;color:var(--brand-dark);}
+.sub{text-align:center;font-size:14px;color:var(--muted);margin:0 0 22px;}
+form{display:flex;flex-direction:column;gap:14px;margin-top:6px}
+label{font-size:13px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);padding-left:4px;}
+.input-wrap{position:relative;display:flex;align-items:center;}
+.input-wrap .icon{position:absolute;left:16px;font-size:22px;opacity:.85;}
+input[type="text"],input[type="tel"]{
+  width:100%;font-size:18px;font-weight:600;font-family:'Inter',sans-serif;
+  padding:16px 16px 16px 54px;border:2px solid var(--line);border-radius:14px;
+  background:#fdfaf3;color:var(--ink);outline:none;
+  transition:border-color .15s, box-shadow .15s, background .15s;
+}
+input:focus{border-color:var(--brand);background:#fff;box-shadow:0 0 0 4px rgba(122,31,31,.12);}
+input::placeholder{color:#b9ad9f;font-weight:500}
+button,input[type="submit"]{
+  margin-top:6px;width:100%;font-size:18px;font-weight:700;letter-spacing:.08em;
+  text-transform:uppercase;font-family:'Inter',sans-serif;padding:18px 20px;color:#fff;
+  background:linear-gradient(180deg,var(--brand) 0%,var(--brand-dark) 100%);
+  border:none;border-radius:14px;box-shadow:0 8px 18px rgba(122,31,31,.28);
+  cursor:pointer;transition:transform .08s ease, box-shadow .15s ease, filter .15s ease;
+}
+input[type="submit"]:active{transform:translateY(1px);box-shadow:0 4px 10px rgba(122,31,31,.28);filter:brightness(.97);}
+.foot{margin-top:22px;text-align:center;font-size:12px;color:var(--muted);letter-spacing:.12em;text-transform:uppercase;}
+.foot .dot{color:var(--accent);margin:0 6px}
+.error{color:#8a1c1c;background:#fdecea;border:1px solid #f3c2c2;border-radius:10px;padding:10px 14px;font-size:13px;font-weight:600;}
+</style>
+</head>
+<body>
+
+  <div class="brand">
+    <div class="crest">🍲</div>
+    <h1>BOBBY DA DHABA</h1>
+    <div class="tagline">Authentic · Desi · Tadka</div>
+    <div class="divider"><span class="line"></span>✦<span class="line"></span></div>
+  </div>
+
+  <div class="card">
+    <h2 class="welcome">Almost there!</h2>
+    <p class="sub">We need your name and phone before your first order (Table {{ table }})</p>
+
+    <form action="/customerinfo" method="POST">
+      <input type="hidden" name="table" value="{{ table }}">
+      <input type="hidden" name="next" value="{{ next_url }}">
+
+      <label for="name">Your Name</label>
+      <div class="input-wrap">
+        <span class="icon">🙂</span>
+        <input id="name" type="text" name="name" placeholder="e.g. Rahul" required>
+      </div>
+
+      <label for="phone">Phone Number</label>
+      <div class="input-wrap">
+        <span class="icon">📱</span>
+        <input id="phone" type="tel" name="phone" pattern="[0-9]{10}" placeholder="10-digit mobile number" required>
+      </div>
+
+      {% if error %}
+      <div class="error">{{ error }}</div>
+      {% endif %}
+
+      <input type="submit" value="Continue →">
+    </form>
+  </div>
+
+  <div class="foot">Dine In <span class="dot">●</span> Fresh <span class="dot">●</span> Hot</div>
+</body>
+</html>

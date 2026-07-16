@@ -1,12 +1,52 @@
-from flask import Flask, render_template, request, session, redirect, abort
+from flask import Flask, render_template, request, session, redirect, abort, jsonify
 from datetime import datetime
+from functools import wraps
 import os
 import sqlite3
+import threading
+import time
 from urllib.parse import parse_qs, urlparse
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env in the project root (if present) into os.environ
+
+from petpooja_client import PetPoojaClient, PetPoojaError
+from menu_sync import normalize_petpooja_menu, build_restaurant_menu, load_category_map
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-in-production")
 DB_PATH = os.path.join(app.root_path, "restaurant.db")
+# Set explicitly (rather than relying on the debug= kwarg passed to app.run())
+# so the settlement-poller startup check below sees the right value even
+# though it runs at import time, before app.run() is ever called — this
+# matters for gunicorn (Phase 8), which imports this module and never calls
+# app.run() at all. Set FLASK_DEBUG=0 in production (e.g. on Render).
+app.debug = os.environ.get("FLASK_DEBUG", "1") == "1"
+
+# Shared secret for the /admin/* routes (menu sync, settlement poll trigger).
+# Set ADMIN_TOKEN as a real env var before deploying — with no token
+# configured we fall back to blocking access entirely rather than leaving
+# these routes wide open (see require_admin_token below).
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
+
+
+def require_admin_token(view_func):
+    """Guards /admin/* routes with a shared-secret token, since this app has
+    no manager/owner login of its own. Pass it as either the `token` query
+    param or an `X-Admin-Token` header."""
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if not ADMIN_TOKEN:
+            abort(503, description="ADMIN_TOKEN is not configured on the server.")
+
+        supplied = request.args.get("token") or request.headers.get("X-Admin-Token")
+
+        if supplied != ADMIN_TOKEN:
+            abort(401, description="Invalid or missing admin token.")
+
+        return view_func(*args, **kwargs)
+
+    return wrapped
 
 
 def get_db_connection():
@@ -25,6 +65,8 @@ def init_db():
                 table_number INTEGER NOT NULL UNIQUE,
                 status TEXT NOT NULL DEFAULT 'AVAILABLE' CHECK (status IN ('AVAILABLE', 'OCCUPIED')),
                 occupied_since TEXT,
+                customer_name TEXT,
+                customer_phone TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -46,6 +88,9 @@ def init_db():
                 table_id INTEGER NOT NULL,
                 kot_type TEXT NOT NULL CHECK (kot_type IN ('NEW TABLE', 'RUNNING TABLE')),
                 payment_status TEXT NOT NULL DEFAULT 'UNPAID' CHECK (payment_status IN ('UNPAID', 'PAID')),
+                petpooja_order_id TEXT,
+                push_status TEXT NOT NULL DEFAULT 'PENDING' CHECK (push_status IN ('PENDING', 'SENT', 'FAILED', 'CANCELLED')),
+                push_error TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (table_id) REFERENCES tables(id)
             );
@@ -60,41 +105,159 @@ def init_db():
                 FOREIGN KEY (kot_id) REFERENCES kots(id)
             );
 
-            CREATE TABLE IF NOT EXISTS bill_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                table_id INTEGER NOT NULL,
-                requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
-                FOREIGN KEY (table_id) REFERENCES tables(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS bills (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                table_id INTEGER NOT NULL,
-                food_total REAL NOT NULL,
-                gst REAL NOT NULL,
-                discount_percent REAL NOT NULL DEFAULT 0,
-                discount_amount REAL NOT NULL DEFAULT 0,
-                final_total REAL NOT NULL,
-                status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'PAID')),
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                paid_at TEXT,
-                FOREIGN KEY (table_id) REFERENCES tables(id)
-            );
-
             CREATE TABLE IF NOT EXISTS counters (
                 name TEXT PRIMARY KEY,
                 value INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS petpooja_items (
+                petpooja_item_id TEXT PRIMARY KEY,
+                petpooja_category_id TEXT,
+                petpooja_category_name TEXT,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                is_veg INTEGER NOT NULL DEFAULT 1,
+                active INTEGER NOT NULL DEFAULT 1,
+                synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
         conn.execute(
             "INSERT OR IGNORE INTO counters (name, value) VALUES ('takeaway_token', 0)"
         )
+
+        # Migrations for columns added after the original DB file was created —
+        # CREATE TABLE IF NOT EXISTS above won't add columns to a pre-existing table.
+        existing_table_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tables)")}
+        if "customer_name" not in existing_table_cols:
+            conn.execute("ALTER TABLE tables ADD COLUMN customer_name TEXT")
+        if "customer_phone" not in existing_table_cols:
+            conn.execute("ALTER TABLE tables ADD COLUMN customer_phone TEXT")
+
+        existing_kot_cols = {row["name"] for row in conn.execute("PRAGMA table_info(kots)")}
+        if "petpooja_order_id" not in existing_kot_cols:
+            conn.execute("ALTER TABLE kots ADD COLUMN petpooja_order_id TEXT")
+        if "push_status" not in existing_kot_cols:
+            conn.execute("ALTER TABLE kots ADD COLUMN push_status TEXT NOT NULL DEFAULT 'PENDING'")
+        if "push_error" not in existing_kot_cols:
+            conn.execute("ALTER TABLE kots ADD COLUMN push_error TEXT")
+
         conn.commit()
 
 
 init_db()
+
+petpooja_client = PetPoojaClient()
+
+
+def save_petpooja_items_to_db(normalized_items):
+    with get_db_connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO petpooja_items
+                (petpooja_item_id, petpooja_category_id, petpooja_category_name, name, price, is_veg, active, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(petpooja_item_id) DO UPDATE SET
+                petpooja_category_id = excluded.petpooja_category_id,
+                petpooja_category_name = excluded.petpooja_category_name,
+                name = excluded.name,
+                price = excluded.price,
+                is_veg = excluded.is_veg,
+                active = excluded.active,
+                synced_at = CURRENT_TIMESTAMP
+            """,
+            [
+                (
+                    item["petpooja_item_id"],
+                    item["petpooja_category_id"],
+                    item["petpooja_category_name"],
+                    item["name"],
+                    item["price"],
+                    1 if item["is_veg"] else 0,
+                    1 if item["active"] else 0,
+                )
+                for item in normalized_items
+            ]
+        )
+        conn.commit()
+
+
+def load_petpooja_items_from_db():
+    with get_db_connection() as conn:
+        rows = conn.execute("SELECT * FROM petpooja_items").fetchall()
+
+    return [
+        {
+            "petpooja_item_id": row["petpooja_item_id"],
+            "petpooja_category_id": row["petpooja_category_id"] or "",
+            "petpooja_category_name": row["petpooja_category_name"] or "",
+            "name": row["name"],
+            "price": row["price"],
+            "is_veg": bool(row["is_veg"]),
+            "active": bool(row["active"]),
+        }
+        for row in rows
+    ]
+
+
+def sync_menu_from_petpooja():
+    """
+    Pulls the live menu from PetPooja, persists it locally, and returns
+    (normalized_items, raw_categories_seen) so the caller/admin route can
+    report which PetPooja category ids still need mapping in category_map.json.
+    Raises PetPoojaError if credentials are missing or the call fails.
+    """
+    raw = petpooja_client.fetch_menu()
+    normalized_items = normalize_petpooja_menu(raw)
+    save_petpooja_items_to_db(normalized_items)
+
+    raw_categories_seen = sorted({
+        (item["petpooja_category_id"], item["petpooja_category_name"])
+        for item in normalized_items
+        if item["petpooja_category_id"]
+    })
+
+    return normalized_items, raw_categories_seen
+
+
+def build_active_menu():
+    """
+    Builds the menu the app should render right now:
+      1. If we have any locally cached PetPooja items (from a previous
+         successful sync) AND category_map.json maps at least one category,
+         merge PetPooja items on top of the fallback menu category-by-category.
+      2. Otherwise, use the original hardcoded FALLBACK_MENU untouched — this
+         keeps local development working before PetPooja is wired up.
+    """
+    category_map = load_category_map()
+    category_map = {k: v for k, v in category_map.items() if not k.startswith("_")}
+
+    cached_items = load_petpooja_items_from_db()
+
+    menu = {key: list(items) for key, items in FALLBACK_MENU.items()}
+
+    if cached_items and any(category_map.values()):
+        petpooja_menu = build_restaurant_menu(cached_items, category_map)
+        for category_key, items in petpooja_menu.items():
+            if items:
+                menu[category_key] = items
+
+    return menu
+
+
+def refresh_menu_globals():
+    global restaurant_menu, MENU_LOOKUP, MENU_LOOKUP_ITEMS
+    restaurant_menu = build_active_menu()
+    MENU_LOOKUP = {
+        item["name"]: item["price"]
+        for category_items in restaurant_menu.values()
+        for item in category_items
+    }
+    MENU_LOOKUP_ITEMS = {
+        item["name"]: item
+        for category_items in restaurant_menu.values()
+        for item in category_items
+    }
 
 
 def get_or_create_table_id(table_number):
@@ -119,6 +282,44 @@ def get_or_create_table_id(table_number):
         conn.commit()
 
         return cursor.lastrowid
+
+
+def get_table_customer_info(table_id):
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT customer_name, customer_phone FROM tables WHERE id = ?",
+            (table_id,)
+        ).fetchone()
+
+    if not row:
+        return None
+
+    if not row["customer_name"] or not row["customer_phone"]:
+        return None
+
+    return {"name": row["customer_name"], "phone": row["customer_phone"]}
+
+
+def save_table_customer_info(table_id, name, phone):
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            UPDATE tables
+            SET customer_name = ?, customer_phone = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (name, phone, table_id)
+        )
+        conn.commit()
+
+
+def clear_table_customer_info(table_id):
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE tables SET customer_name = NULL, customer_phone = NULL WHERE id = ?",
+            (table_id,)
+        )
+        conn.commit()
 
 
 def resolve_table_value():
@@ -176,6 +377,24 @@ def format_table_timestamp(value):
         return value
 
 
+def describe_order_status(payment_status, push_status):
+    """
+    Translates internal bookkeeping fields (payment_status/push_status) into a
+    single customer-friendly status — customers should never see internal
+    jargon like "NEW TABLE"/"RUNNING TABLE" (that's just KOT print grouping)
+    or raw enum values.
+    """
+    if push_status == "CANCELLED":
+        return {"label": "Cancelled", "emoji": "❌", "tone": "cancelled"}
+    if push_status == "FAILED":
+        return {"label": "Confirm with counter", "emoji": "⚠️", "tone": "warning"}
+    if push_status == "PENDING":
+        return {"label": "Confirming with kitchen", "emoji": "⏳", "tone": "warning"}
+    if payment_status == "PAID":
+        return {"label": "Paid", "emoji": "💰", "tone": "paid"}
+    return {"label": "Sent to kitchen", "emoji": "✅", "tone": "sent"}
+
+
 def get_table_order_history(table_id):
     with get_db_connection() as conn:
         kot_rows = conn.execute(
@@ -183,8 +402,8 @@ def get_table_order_history(table_id):
             SELECT
                 k.id,
                 k.kot_number,
-                k.kot_type,
                 k.payment_status,
+                k.push_status,
                 k.created_at,
                 COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS total
             FROM kots k
@@ -195,7 +414,7 @@ def get_table_order_history(table_id):
                   FROM tables
                   WHERE id = k.table_id
               )
-            GROUP BY k.id, k.kot_number, k.kot_type, k.payment_status, k.created_at
+            GROUP BY k.id, k.kot_number, k.payment_status, k.push_status, k.created_at
             ORDER BY k.id ASC
             """,
             (table_id,)
@@ -216,8 +435,7 @@ def get_table_order_history(table_id):
 
             orders.append({
                 "order_id": kot["kot_number"],
-                "order_type": kot["kot_type"],
-                "payment_status": kot["payment_status"],
+                "status": describe_order_status(kot["payment_status"], kot["push_status"]),
                 "time": format_table_timestamp(kot["created_at"]),
                 "total": float(kot["total"]),
                 "items": [
@@ -240,33 +458,20 @@ def get_table_bill_summary(table_id):
             SELECT
                 k.id,
                 k.kot_number,
-                k.kot_type,
                 k.created_at,
                 COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS total
             FROM kots k
             LEFT JOIN kot_items ki ON ki.kot_id = k.id
             WHERE k.table_id = ? AND k.payment_status = 'UNPAID'
-            GROUP BY k.id, k.kot_number, k.kot_type, k.created_at
+            GROUP BY k.id, k.kot_number, k.created_at
             ORDER BY k.id ASC
             """,
             (table_id,)
         ).fetchall()
 
-        bill_request_row = conn.execute(
-            """
-            SELECT requested_at
-            FROM bill_requests
-            WHERE table_id = ? AND is_active = 1
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (table_id,)
-        ).fetchone()
-
     orders = [
         {
             "order_id": row["kot_number"],
-            "order_type": row["kot_type"],
             "time": format_table_timestamp(row["created_at"]),
             "total": float(row["total"])
         }
@@ -276,18 +481,150 @@ def get_table_bill_summary(table_id):
     food_total = sum(order["total"] for order in orders)
     gst = round(food_total * 0.05, 2)
     grand_total = round(food_total + gst, 2)
+    rounded_total = round(grand_total)
 
     return {
         "orders": orders,
         "food_total": food_total,
         "gst": gst,
         "grand_total": grand_total,
-        "bill_requested": bill_request_row is not None,
-        "requested_at": format_table_timestamp(bill_request_row["requested_at"]) if bill_request_row else None,
+        "rounded_total": rounded_total,
     }
 
-# MENU DATA
-restaurant_menu = {
+
+def settle_and_clear_table(table_id):
+    """
+    Called once PetPooja reports a table's bill as settled. Marks all of the
+    table's KOTs PAID and resets the table so the next customer who enters
+    this table number gets a clean menu with no leftover orders/bill/customer
+    info from the previous guest.
+    """
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE kots SET payment_status = 'PAID' WHERE table_id = ? AND payment_status = 'UNPAID'",
+            (table_id,)
+        )
+        conn.execute(
+            "DELETE FROM table_cart_items WHERE table_id = ?",
+            (table_id,)
+        )
+        conn.execute(
+            """
+            UPDATE tables
+            SET status = 'AVAILABLE', occupied_since = NULL, customer_name = NULL, customer_phone = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (table_id,)
+        )
+        conn.commit()
+
+
+# Statuses PetPooja might report for an order. PLACEHOLDER — correct once
+# real docs are available (see PETPOOJA_SETUP.md).
+PETPOOJA_SETTLED_STATUSES = {"settled", "paid", "closed", "complete", "completed", "5"}
+# Manager voided/cancelled the KOT in PetPooja (e.g. item unavailable, customer
+# walked out without paying) — no money owed, but the table should still free
+# up locally instead of staying stuck "OCCUPIED" forever.
+PETPOOJA_CANCELLED_STATUSES = {"cancelled", "canceled", "void", "voided", "rejected"}
+
+
+def poll_petpooja_settlements():
+    """
+    Phase 5: since PetPooja has no push webhook for "table settled" for 3rd
+    party apps, we poll instead. For every order we've sent to PetPooja and
+    is still marked unpaid locally, ask PetPooja for its current status:
+      - settled/paid  -> mark that order PAID locally (bill was paid)
+      - cancelled/void -> mark that order PAID locally too (nothing owed —
+        e.g. item unavailable and customer left without ordering anything
+        else), just tagged with push_status='CANCELLED' for the record
+      - anything else  -> leave alone, still genuinely in progress
+    Once a table has zero remaining UNPAID orders (whether resolved by
+    payment or cancellation), the table is auto-cleared locally so the next
+    customer sitting there gets a clean slate.
+    Runs on a background thread every interval. Never raises — a PetPooja
+    hiccup should not crash the poller loop.
+    """
+    if not petpooja_client.is_configured():
+        return
+
+    with get_db_connection() as conn:
+        kot_rows = conn.execute(
+            """
+            SELECT id, table_id, petpooja_order_id
+            FROM kots
+            WHERE payment_status = 'UNPAID' AND push_status = 'SENT'
+            """
+        ).fetchall()
+
+    tables_touched = set()
+
+    for kot_row in kot_rows:
+        order_id = kot_row["petpooja_order_id"]
+
+        if not order_id:
+            continue
+
+        try:
+            status_response = petpooja_client.get_order_status(order_id)
+        except PetPoojaError as exc:
+            print(f"[petpooja-poll] status check failed for order {order_id}: {exc}")
+            continue
+
+        status_value = str(status_response.get("status", "")).strip().lower()  # PLACEHOLDER field name
+
+        if status_value in PETPOOJA_SETTLED_STATUSES:
+            with get_db_connection() as conn:
+                conn.execute(
+                    "UPDATE kots SET payment_status = 'PAID' WHERE id = ?",
+                    (kot_row["id"],)
+                )
+                conn.commit()
+            tables_touched.add(kot_row["table_id"])
+        elif status_value in PETPOOJA_CANCELLED_STATUSES:
+            with get_db_connection() as conn:
+                conn.execute(
+                    "UPDATE kots SET payment_status = 'PAID', push_status = 'CANCELLED' WHERE id = ?",
+                    (kot_row["id"],)
+                )
+                conn.commit()
+            tables_touched.add(kot_row["table_id"])
+            print(f"[petpooja-poll] order {order_id} was cancelled/voided in PetPooja")
+
+    for table_id in tables_touched:
+        with get_db_connection() as conn:
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS count FROM kots WHERE table_id = ? AND payment_status = 'UNPAID'",
+                (table_id,)
+            ).fetchone()
+
+        if remaining["count"] == 0:
+            settle_and_clear_table(table_id)
+            print(f"[petpooja-poll] table_id={table_id} fully resolved in PetPooja — cleared locally")
+
+
+def start_settlement_poller(interval_seconds=20):
+    """Starts the background polling thread once (guarded against the Flask
+    debug reloader, which otherwise spawns two processes and would start the
+    poller twice)."""
+    is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+
+    if app.debug and not is_reloader_child:
+        return  # this is the reloader's parent watcher process, not the real app
+
+    def _loop():
+        while True:
+            time.sleep(interval_seconds)
+            try:
+                poll_petpooja_settlements()
+            except Exception as exc:  # keep the poller alive no matter what
+                print(f"[petpooja-poll] unexpected error: {exc}")
+
+    thread = threading.Thread(target=_loop, daemon=True)
+    thread.start()
+
+# FALLBACK MENU DATA — used until PetPooja is synced & category_map.json is filled in.
+FALLBACK_MENU = {
    "veg_soups": [
 {"name": "Sweet Corn Soup Veg", "price": 99},
 {"name": "Hot N Sour Veg", "price": 99},
@@ -583,17 +920,13 @@ restaurant_menu = {
 
 # Server-side price lookup (name -> price). Used to validate/derive prices
 # for every add-to-cart request so a client can never submit its own price.
-MENU_LOOKUP = {
-    item["name"]: item["price"]
-    for category_items in restaurant_menu.values()
-    for item in category_items
-}
+restaurant_menu = {}
+MENU_LOOKUP = {}
+MENU_LOOKUP_ITEMS = {}
+refresh_menu_globals()
 
-MENU_LOOKUP_ITEMS = {
-    item["name"]: item
-    for category_items in restaurant_menu.values()
-    for item in category_items
-}
+start_settlement_poller()
+
 
 
 @app.route("/")
@@ -604,6 +937,52 @@ def home():
 @app.route("/dinein")
 def dinein():
     return render_template("dinein.html")
+
+
+@app.route("/dinein-start", methods=["POST"])
+def dinein_start():
+    table = (request.form.get("table") or "").strip()
+    name = (request.form.get("name") or "").strip()
+    phone = (request.form.get("phone") or "").strip()
+
+    if not table or not name or not phone:
+        return render_template(
+            "dinein.html",
+            error="Please fill in table number, name and phone to continue.",
+            table=table, name=name, phone=phone
+        )
+
+    table_id = get_or_create_table_id(table)
+    save_table_customer_info(table_id, name, phone)
+
+    return redirect(f"/menu?table={table}")
+
+
+@app.route("/customerinfo")
+def customerinfo():
+    table = request.args.get("table", "")
+    next_url = request.args.get("next", "/menu")
+    return render_template("customerinfo.html", table=table, next_url=next_url)
+
+
+@app.route("/customerinfo", methods=["POST"])
+def customerinfo_submit():
+    table = (request.form.get("table") or "").strip()
+    name = (request.form.get("name") or "").strip()
+    phone = (request.form.get("phone") or "").strip()
+    next_url = request.form.get("next") or f"/menu?table={table}"
+
+    if not table or not name or not phone:
+        return render_template(
+            "customerinfo.html",
+            table=table, next_url=next_url,
+            error="Please fill in your name and phone to continue."
+        )
+
+    table_id = get_or_create_table_id(table)
+    save_table_customer_info(table_id, name, phone)
+
+    return redirect(next_url)
 
 
 @app.route("/menu")
@@ -819,6 +1198,65 @@ def updatecartqty():
     )
 
 
+def build_petpooja_order_payload(table, customer_info, kot_type, kot_number, table_cart, total):
+    """
+    Builds the Save Order payload sent to PetPooja.
+    PLACEHOLDER shape — correct field names once real PetPooja docs are available
+    (see PETPOOJA_SETUP.md). petpooja_client.push_order() merges this with auth fields.
+    """
+    is_takeaway = table.upper().startswith("TK")
+    gst = round(total * 0.05, 2)
+
+    return {
+        "OrderInfo": {
+            "Customer": {
+                "name": customer_info["name"],
+                "phone": customer_info["phone"],
+            },
+            "OrderType": "Takeaway" if is_takeaway else "Dine In",
+            "TableNo": table,
+            "LocalOrderId": f"KOT{kot_number}",
+            "OrderItem": [
+                {
+                    "name": item["name"],
+                    "price": item["price"],
+                    "quantity": item["quantity"],
+                    "special_instructions": item.get("instructions") or "",
+                }
+                for item in table_cart
+            ],
+            "Tax": [{"name": "GST", "amount": gst}],
+            "total": round(total + gst, 2),
+        }
+    }
+
+
+def push_kot_to_petpooja(kot_id, order_payload):
+    """
+    Fire-and-record call to PetPooja after the local KOT is already committed.
+    Never raises — customer flow must not break if PetPooja is unreachable;
+    push_status/push_error are stored so staff can be alerted instead.
+    """
+    if not petpooja_client.is_configured():
+        push_status, petpooja_order_id, push_error = "PENDING", None, "PetPooja credentials not configured yet"
+    else:
+        try:
+            response = petpooja_client.push_order(order_payload)
+            petpooja_order_id = str(response.get("order_id", ""))  # PLACEHOLDER field name
+            push_status, push_error = "SENT", None
+        except PetPoojaError as exc:
+            push_status, petpooja_order_id, push_error = "FAILED", None, str(exc)
+
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE kots SET petpooja_order_id = ?, push_status = ?, push_error = ? WHERE id = ?",
+            (petpooja_order_id, push_status, push_error, kot_id)
+        )
+        conn.commit()
+
+    return push_status
+
+
 @app.route("/placeorder", methods=["POST"])
 def placeorder():
     table = resolve_table_value()
@@ -827,6 +1265,11 @@ def placeorder():
         return redirect("/menu")
 
     table_id = get_or_create_table_id(table)
+
+    customer_info = get_table_customer_info(table_id)
+    if not customer_info:
+        return redirect(f"/customerinfo?table={table}&next=/cart%3Ftable%3D{table}")
+
     table_cart = get_table_cart_items(table_id)
 
     if not table_cart:
@@ -924,6 +1367,11 @@ def placeorder():
     table_gst = round(table_food_total * 0.05, 2)
     table_total_with_gst = round(table_food_total + table_gst, 2)
 
+    order_payload = build_petpooja_order_payload(
+        table, customer_info, kot_type, next_kot_number, table_cart, total
+    )
+    push_status = push_kot_to_petpooja(kot_id, order_payload)
+
     return render_template(
         "order_success.html",
         order_id=next_kot_number,
@@ -933,6 +1381,7 @@ def placeorder():
         table_food_total=table_food_total,
         table_gst=table_gst,
         table_total_with_gst=table_total_with_gst,
+        push_status=push_status,
         nav_active="orders"
     )
 
@@ -973,303 +1422,9 @@ def bill():
         food_total=bill_data["food_total"],
         gst=bill_data["gst"],
         grand_total=bill_data["grand_total"],
-        bill_requested=bill_data["bill_requested"],
-        requested_at=bill_data["requested_at"],
+        rounded_total=bill_data["rounded_total"],
         nav_active="bill"
     )
-
-
-@app.route("/kitchen")
-def kitchen():
-    with get_db_connection() as conn:
-        kot_rows = conn.execute(
-            """
-            SELECT
-                k.id,
-                k.kot_number,
-                k.kot_type,
-                k.created_at,
-                t.table_number
-            FROM kots k
-            INNER JOIN tables t ON t.id = k.table_id
-            WHERE k.payment_status = 'UNPAID'
-            ORDER BY k.id DESC
-            """
-        ).fetchall()
-
-        kitchen_orders = []
-
-        for kot in kot_rows:
-            item_rows = conn.execute(
-                """
-                SELECT item_name, quantity, COALESCE(instructions, '') AS instructions
-                FROM kot_items
-                WHERE kot_id = ?
-                ORDER BY id ASC
-                """,
-                (kot["id"],)
-            ).fetchall()
-
-            time_value = kot["created_at"]
-            try:
-                time_value = datetime.strptime(kot["created_at"], "%Y-%m-%d %H:%M:%S").strftime("%I:%M %p")
-            except (ValueError, TypeError):
-                pass
-
-            kitchen_orders.append({
-                "order_id": kot["kot_number"],
-                "status": kot["kot_type"],
-                "time": time_value,
-                "table": str(kot["table_number"]),
-                "items": [
-                    {
-                        "name": item["item_name"],
-                        "quantity": item["quantity"],
-                        "instructions": item["instructions"]
-                    }
-                    for item in item_rows
-                ]
-            })
-
-    return render_template(
-        "kitchen.html",
-        orders=kitchen_orders
-    )
-@app.route("/requestbill", methods=["POST"])
-def requestbill():
-    table = resolve_table_value()
-
-    if not table:
-        return redirect("/menu")
-
-    table_id = get_or_create_table_id(table)
-
-    with get_db_connection() as conn:
-        existing = conn.execute(
-            """
-            SELECT id
-            FROM bill_requests
-            WHERE table_id = ? AND is_active = 1
-            LIMIT 1
-            """,
-            (table_id,)
-        ).fetchone()
-
-        if not existing:
-            conn.execute(
-                "INSERT INTO bill_requests (table_id, is_active) VALUES (?, 1)",
-                (table_id,)
-            )
-            conn.commit()
-
-    return render_template(
-        "bill_requested.html",
-        table=table
-    )
-@app.route("/manager")
-def manager():
-    with get_db_connection() as conn:
-        bill_request_rows = conn.execute(
-            """
-            SELECT t.table_number
-            FROM bill_requests br
-            INNER JOIN tables t ON t.id = br.table_id
-            WHERE br.is_active = 1
-            ORDER BY br.id ASC
-            """
-        ).fetchall()
-
-        order_rows = conn.execute(
-            """
-            SELECT
-                k.kot_number AS order_id,
-                t.table_number,
-                COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS total
-            FROM kots k
-            INNER JOIN tables t ON t.id = k.table_id
-            LEFT JOIN kot_items ki ON ki.kot_id = k.id
-            WHERE k.payment_status = 'UNPAID'
-            GROUP BY k.id, k.kot_number, t.table_number
-            ORDER BY k.id ASC
-            """
-        ).fetchall()
-
-    manager_bill_requests = [
-        {"table": str(row["table_number"])}
-        for row in bill_request_rows
-    ]
-
-    manager_orders = [
-        {
-            "order_id": row["order_id"],
-            "table": str(row["table_number"]),
-            "total": row["total"]
-        }
-        for row in order_rows
-    ]
-
-    return render_template(
-        "manager.html",
-        bill_requests=manager_bill_requests,
-        orders=manager_orders
-    )
-@app.route("/generatebill", methods=["POST"])
-def generatebill():
-
-    table = request.form.get("table")
-
-    if not table:
-        return redirect("/manager")
-
-    table_id = get_or_create_table_id(table)
-
-    try:
-        discount = float(request.form.get("discount", 0) or 0)
-    except (TypeError, ValueError):
-        discount = 0.0
-
-    # Clamp to a sane 0-100% range regardless of what the client sends.
-    discount = max(0.0, min(discount, 100.0))
-
-    with get_db_connection() as conn:
-        total_row = conn.execute(
-            """
-            SELECT COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS food_total
-            FROM kots k
-            INNER JOIN kot_items ki ON ki.kot_id = k.id
-            WHERE k.table_id = ? AND k.payment_status = 'UNPAID'
-            """,
-            (table_id,)
-        ).fetchone()
-
-        food_total = float(total_row["food_total"])
-        gst = food_total * 0.05
-        subtotal = food_total + gst
-        discount_amount = subtotal * discount / 100
-        final_total = subtotal - discount_amount
-        rounded_total = round(final_total)
-
-        # Replace any earlier pending bill for this table so /markpaid always
-        # settles using the latest discount instead of losing it.
-        conn.execute(
-            "DELETE FROM bills WHERE table_id = ? AND status = 'PENDING'",
-            (table_id,)
-        )
-        conn.execute(
-            """
-            INSERT INTO bills (table_id, food_total, gst, discount_percent, discount_amount, final_total, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'PENDING')
-            """,
-            (table_id, food_total, gst, discount, discount_amount, final_total)
-        )
-        conn.commit()
-
-    return render_template(
-        "final_bill.html",
-        table=table,
-        food_total=food_total,
-        gst=gst,
-        discount=discount,
-        discount_amount=discount_amount,
-        final_total=final_total,
-        rounded_total=rounded_total
-    )
-
-
-@app.route("/markpaid", methods=["POST"])
-def markpaid():
-    table = resolve_table_value()
-
-    if table:
-        table_id = get_or_create_table_id(table)
-
-        with get_db_connection() as conn:
-            pending_bill = conn.execute(
-                """
-                SELECT id, food_total, gst, discount_percent, discount_amount, final_total
-                FROM bills
-                WHERE table_id = ? AND status = 'PENDING'
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (table_id,)
-            ).fetchone()
-
-            if pending_bill:
-                # Settle using the manager's already-generated (and possibly
-                # discounted) bill instead of recomputing from scratch.
-                conn.execute(
-                    """
-                    UPDATE bills
-                    SET status = 'PAID', paid_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (pending_bill["id"],)
-                )
-            else:
-                # Manager marked paid without generating a bill first — fall
-                # back to the raw unpaid total with zero discount, but still
-                # record it so owner reporting stays accurate.
-                total_row = conn.execute(
-                    """
-                    SELECT COALESCE(SUM(ki.unit_price * ki.quantity), 0) AS food_total
-                    FROM kots k
-                    INNER JOIN kot_items ki ON ki.kot_id = k.id
-                    WHERE k.table_id = ? AND k.payment_status = 'UNPAID'
-                    """,
-                    (table_id,)
-                ).fetchone()
-
-                food_total = float(total_row["food_total"])
-                gst = food_total * 0.05
-                final_total = food_total + gst
-
-                conn.execute(
-                    """
-                    INSERT INTO bills (table_id, food_total, gst, discount_percent, discount_amount, final_total, status, paid_at)
-                    VALUES (?, ?, ?, 0, 0, ?, 'PAID', CURRENT_TIMESTAMP)
-                    """,
-                    (table_id, food_total, gst, final_total)
-                )
-
-            conn.execute(
-                """
-                UPDATE kots
-                SET payment_status = 'PAID'
-                WHERE table_id = ? AND payment_status = 'UNPAID'
-                """,
-                (table_id,)
-            )
-
-            conn.execute(
-                """
-                UPDATE tables
-                SET
-                    status = 'AVAILABLE',
-                    occupied_since = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (table_id,)
-            )
-
-            conn.execute(
-                """
-                UPDATE bill_requests
-                SET is_active = 0
-                WHERE table_id = ? AND is_active = 1
-                """,
-                (table_id,)
-            )
-
-            conn.execute(
-                "DELETE FROM table_cart_items WHERE table_id = ?",
-                (table_id,)
-            )
-
-            conn.commit()
-
-    return redirect("/manager")
 
 
 @app.route("/veg")
@@ -1295,6 +1450,21 @@ def nonveg():
 
 @app.route("/takeaway")
 def takeaway():
+    return render_template("takeaway.html")
+
+
+@app.route("/takeaway-start", methods=["POST"])
+def takeaway_start():
+    name = (request.form.get("name") or "").strip()
+    phone = (request.form.get("phone") or "").strip()
+
+    if not name or not phone:
+        return render_template(
+            "takeaway.html",
+            error="Please fill in your name and phone to continue.",
+            name=name, phone=phone
+        )
+
     # Persisted, atomic counter in SQLite instead of an in-memory global —
     # avoids duplicate tokens under concurrent requests or after a restart.
     with get_db_connection() as conn:
@@ -1310,87 +1480,64 @@ def takeaway():
         conn.commit()
 
     token = f"TK{next_value:03d}"
+    table_id = get_or_create_table_id(token)
+    save_table_customer_info(table_id, name, phone)
 
     return redirect(f"/menu?table={token}")
 
 
-@app.route("/owner")
-def owner():
-    """Owner dashboard showing today's total sales with GST"""
-    from datetime import datetime as dt
+@app.route("/admin/poll-settlements")
+@require_admin_token
+def admin_poll_settlements():
+    """
+    Manually triggers one settlement-poll cycle immediately, instead of
+    waiting for the background thread's interval. Useful for testing.
+    """
+    poll_petpooja_settlements()
+    return jsonify({"status": "ok", "message": "Poll cycle executed. Check server logs for details."})
 
-    # SQLite's CURRENT_TIMESTAMP is stored in UTC, so "today" must also be
-    # computed in UTC — comparing it against the server's local date caused
-    # bills to vanish from the dashboard once local time crossed midnight
-    # ahead of UTC (e.g. evenings in IST, UTC+5:30).
-    today = dt.utcnow().strftime("%Y-%m-%d")
 
-    with get_db_connection() as conn:
-        # Revenue is reported from the `bills` table (one row per settled
-        # checkout) so any manager discount is correctly reflected — summing
-        # raw kot_items would ignore discounts and overstate revenue.
-        paid_bills = conn.execute(
-            """
-            SELECT
-                b.id,
-                t.table_number,
-                b.food_total,
-                b.gst,
-                b.discount_percent,
-                b.discount_amount,
-                b.final_total,
-                b.paid_at
-            FROM bills b
-            INNER JOIN tables t ON t.id = b.table_id
-            WHERE b.status = 'PAID'
-            AND DATE(b.paid_at) = ?
-            ORDER BY b.paid_at DESC
-            """,
-            (today,)
-        ).fetchall()
+@app.route("/admin/sync-menu")
+@require_admin_token
+def admin_sync_menu():
+    """
+    Manually triggers a PetPooja menu pull and rebuilds the live menu.
+    """
+    if not petpooja_client.is_configured():
+        return jsonify({
+            "status": "not_configured",
+            "message": (
+                "Set PETPOOJA_APP_KEY, PETPOOJA_APP_SECRET, PETPOOJA_ACCESS_TOKEN "
+                "and PETPOOJA_REST_ID as environment variables, then retry."
+            )
+        }), 400
 
-        # Calculate totals
-        total_food = 0
-        total_gst = 0
-        total_revenue = 0
+    try:
+        normalized_items, raw_categories_seen = sync_menu_from_petpooja()
+    except PetPoojaError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 502
 
-        finalized_bills = []
+    refresh_menu_globals()
 
-        for bill in paid_bills:
-            food_total = float(bill["food_total"])
-            gst = float(bill["gst"])
-            grand_total = float(bill["final_total"])
+    category_map = load_category_map()
+    unmapped_ids = {cat_id for cat_id, _ in raw_categories_seen} - {
+        str(pid) for ids in category_map.values() for pid in ids
+    }
 
-            total_food += food_total
-            total_gst += gst
-            total_revenue += grand_total
+    return jsonify({
+        "status": "ok",
+        "items_synced": len(normalized_items),
+        "raw_categories_seen": [
+            {"category_id": cid, "category_name": cname} for cid, cname in raw_categories_seen
+        ],
+        "unmapped_category_ids": sorted(unmapped_ids),
+        "note": (
+            "Add any unmapped_category_ids to category_map.json under the matching "
+            "our_category_key, then call /admin/sync-menu again to pick them up."
+        )
+    })
 
-            time_value = bill["paid_at"]
-            try:
-                time_value = dt.strptime(bill["paid_at"], "%Y-%m-%d %H:%M:%S").strftime("%I:%M %p")
-            except (ValueError, TypeError):
-                pass
-
-            finalized_bills.append({
-                "bill_id": bill["id"],
-                "table": str(bill["table_number"]),
-                "food_total": food_total,
-                "gst": gst,
-                "discount_percent": float(bill["discount_percent"]),
-                "discount_amount": float(bill["discount_amount"]),
-                "total": grand_total,
-                "time": time_value
-            })
-
-    return render_template(
-        "owner.html",
-        total_food=total_food,
-        total_gst=total_gst,
-        total_revenue=total_revenue,
-        finalized_bills=finalized_bills,
-        bill_count=len(finalized_bills)
-    )
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=app.debug)

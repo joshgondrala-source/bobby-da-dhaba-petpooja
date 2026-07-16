@@ -196,14 +196,30 @@ input[type="submit"]:active{
 
   <div class="card">
     <h2 class="welcome">Welcome, Guest</h2>
-    <p class="sub">Please enter your table number to begin ordering</p>
+    <p class="sub">Enter your table number, name and phone to begin ordering</p>
 
-    <form action="/menu" method="GET">
+    <form action="/dinein-start" method="POST">
       <label for="table">Table Number</label>
       <div class="input-wrap">
         <span class="icon">🍽️</span>
-        <input id="table" type="number" name="table" min="1" placeholder="e.g. 7" required>
+        <input id="table" type="number" name="table" min="1" placeholder="e.g. 7" value="{{ table or '' }}" required>
       </div>
+
+      <label for="name">Your Name</label>
+      <div class="input-wrap">
+        <span class="icon">🙂</span>
+        <input id="name" type="text" name="name" placeholder="e.g. Rahul" value="{{ name or '' }}" required style="font-size:18px;padding:16px 16px 16px 54px;">
+      </div>
+
+      <label for="phone">Phone Number</label>
+      <div class="input-wrap">
+        <span class="icon">📱</span>
+        <input id="phone" type="tel" name="phone" pattern="[0-9]{10}" placeholder="10-digit mobile number" value="{{ phone or '' }}" required style="font-size:18px;padding:16px 16px 16px 54px;">
+      </div>
+
+      {% if error %}
+      <div style="color:#8a1c1c;background:#fdecea;border:1px solid #f3c2c2;border-radius:10px;padding:10px 14px;font-size:13px;font-weight:600;">{{ error }}</div>
+      {% endif %}
 
       <input type="submit" value="Continue to Menu →">
     </form>

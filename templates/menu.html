@@ -375,6 +375,24 @@ body {
   color: var(--muted);
 }
 .foot-note b { color: var(--gold); font-weight: 800; }
+.dine-notice {
+  margin-top: 18px;
+  padding: 14px 16px;
+  border-radius: var(--r-sm);
+  background: var(--gold-bg);
+  border: 1px solid rgba(200,136,30,.35);
+  color: var(--ink2);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.dine-notice b { color: var(--brand); }
+.dine-notice a {
+  display: inline-block;
+  margin-top: 10px;
+  font-weight: 800;
+  color: var(--brand);
+  text-decoration: underline;
+}
 </style>
 </head>
 <body>
@@ -403,6 +421,14 @@ body {
     <div class="ornament-inner">✦ ✦ ✦</div>
   </div>
 </header>
+
+{% if table and not table.startswith('TK') %}
+<div class="dine-notice">
+  <b>Ordering for Table {{ table }}.</b> Once your order is placed, please don't move to another table — if you do, tell our staff so they can serve you correctly.
+  <br>
+  <a href="/takeaway" target="_blank" rel="noopener">🥡 Also want a separate takeaway parcel? Order it here</a>
+</div>
+{% endif %}
 
 <!-- GRID -->
 <main class="grid">
