@@ -3,8 +3,6 @@ from datetime import datetime
 from functools import wraps
 import os
 import sqlite3
-import threading
-import time
 from urllib.parse import parse_qs, urlparse
 from dotenv import load_dotenv
 
@@ -28,6 +26,12 @@ app.debug = os.environ.get("FLASK_DEBUG", "1") == "1"
 # configured we fall back to blocking access entirely rather than leaving
 # these routes wide open (see require_admin_token below).
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
+
+# Public base URL of this app (e.g. "https://bobby-da-dhaba.onrender.com" or
+# the Azure App Service URL) — required so Save Order requests can include a
+# working callback_url for PetPooja's status webhook. Must be reachable from
+# the public internet (not localhost) once credentials are real.
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
 
 def require_admin_token(view_func):
@@ -89,6 +93,8 @@ def init_db():
                 kot_type TEXT NOT NULL CHECK (kot_type IN ('NEW TABLE', 'RUNNING TABLE')),
                 payment_status TEXT NOT NULL DEFAULT 'UNPAID' CHECK (payment_status IN ('UNPAID', 'PAID')),
                 petpooja_order_id TEXT,
+                client_order_id TEXT UNIQUE,
+                kitchen_status TEXT,
                 push_status TEXT NOT NULL DEFAULT 'PENDING' CHECK (push_status IN ('PENDING', 'SENT', 'FAILED', 'CANCELLED')),
                 push_error TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -137,6 +143,10 @@ def init_db():
         existing_kot_cols = {row["name"] for row in conn.execute("PRAGMA table_info(kots)")}
         if "petpooja_order_id" not in existing_kot_cols:
             conn.execute("ALTER TABLE kots ADD COLUMN petpooja_order_id TEXT")
+        if "client_order_id" not in existing_kot_cols:
+            conn.execute("ALTER TABLE kots ADD COLUMN client_order_id TEXT")
+        if "kitchen_status" not in existing_kot_cols:
+            conn.execute("ALTER TABLE kots ADD COLUMN kitchen_status TEXT")
         if "push_status" not in existing_kot_cols:
             conn.execute("ALTER TABLE kots ADD COLUMN push_status TEXT NOT NULL DEFAULT 'PENDING'")
         if "push_error" not in existing_kot_cols:
@@ -200,15 +210,18 @@ def load_petpooja_items_from_db():
     ]
 
 
-def sync_menu_from_petpooja():
+def ingest_petpooja_menu_push(raw_json):
     """
-    Pulls the live menu from PetPooja, persists it locally, and returns
-    (normalized_items, raw_categories_seen) so the caller/admin route can
-    report which PetPooja category ids still need mapping in category_map.json.
-    Raises PetPoojaError if credentials are missing or the call fails.
+    Processes one "Push Menu" webhook call from PetPooja (see
+    /petpooja/push-menu route). PetPooja calls OUR server with the full menu
+    whenever it changes in their system — there is no endpoint for us to
+    pull/fetch it on demand (the old Fetch Menu API is deprecated).
+
+    Returns (normalized_items, raw_categories_seen) so the route/admin tools
+    can report which PetPooja category ids still need mapping in
+    category_map.json.
     """
-    raw = petpooja_client.fetch_menu()
-    normalized_items = normalize_petpooja_menu(raw)
+    normalized_items = normalize_petpooja_menu(raw_json)
     save_petpooja_items_to_db(normalized_items)
 
     raw_categories_seen = sorted({
@@ -520,108 +533,71 @@ def settle_and_clear_table(table_id):
         conn.commit()
 
 
-# Statuses PetPooja might report for an order. PLACEHOLDER — correct once
-# real docs are available (see PETPOOJA_SETUP.md).
-PETPOOJA_SETTLED_STATUSES = {"settled", "paid", "closed", "complete", "completed", "5"}
-# Manager voided/cancelled the KOT in PetPooja (e.g. item unavailable, customer
-# walked out without paying) — no money owed, but the table should still free
-# up locally instead of staying stuck "OCCUPIED" forever.
-PETPOOJA_CANCELLED_STATUSES = {"cancelled", "canceled", "void", "voided", "rejected"}
+# Kitchen-state codes PetPooja sends via the /petpooja/callback webhook (see
+# the Save Order API's "callback_url" field and the "Order Callback" section
+# of PetPooja's real API docs). These describe KITCHEN progress, not
+# payment/settlement — PetPooja's documented API has no "bill paid" signal
+# at all. -1=Cancelled, 1/2/3=Accepted, 4=Dispatched, 5=Food Ready,
+# 10=Delivered.
+PETPOOJA_CANCELLED_STATUS = "-1"
 
 
-def poll_petpooja_settlements():
+def handle_petpooja_callback(payload):
     """
-    Phase 5: since PetPooja has no push webhook for "table settled" for 3rd
-    party apps, we poll instead. For every order we've sent to PetPooja and
-    is still marked unpaid locally, ask PetPooja for its current status:
-      - settled/paid  -> mark that order PAID locally (bill was paid)
-      - cancelled/void -> mark that order PAID locally too (nothing owed —
-        e.g. item unavailable and customer left without ordering anything
-        else), just tagged with push_status='CANCELLED' for the record
-      - anything else  -> leave alone, still genuinely in progress
-    Once a table has zero remaining UNPAID orders (whether resolved by
-    payment or cancellation), the table is auto-cleared locally so the next
-    customer sitting there gets a clean slate.
-    Runs on a background thread every interval. Never raises — a PetPooja
-    hiccup should not crash the poller loop.
+    Processes one PetPooja order-status webhook call (see /petpooja/callback
+    route). Matches on our own `client_order_id` (PetPooja's docs call this
+    field "orderID" in the callback body, but define it as "the client order
+    id" — i.e. the id WE originally sent, not PetPooja's internal numeric
+    order id).
+
+    Only the Cancelled status is acted on automatically (frees the table,
+    since nothing is owed). All other kitchen statuses are just recorded for
+    visibility. There is currently no reliable "bill settled/paid" signal in
+    PetPooja's documented API — see PETPOOJA_SETUP.md for the follow-up
+    question to ask PetPooja, and /admin/settle-table for the manual
+    fallback staff can use until that's answered.
     """
-    if not petpooja_client.is_configured():
-        return
+    client_order_id = payload.get("orderID")
+    status = str(payload.get("status", "")).strip()
+
+    if not client_order_id:
+        return {"success": "0", "message": "Missing orderID"}, 400
 
     with get_db_connection() as conn:
-        kot_rows = conn.execute(
-            """
-            SELECT id, table_id, petpooja_order_id
-            FROM kots
-            WHERE payment_status = 'UNPAID' AND push_status = 'SENT'
-            """
-        ).fetchall()
+        kot_row = conn.execute(
+            "SELECT id, table_id FROM kots WHERE client_order_id = ?",
+            (client_order_id,)
+        ).fetchone()
 
-    tables_touched = set()
+        if not kot_row:
+            return {"success": "0", "message": "Unknown orderID"}, 404
 
-    for kot_row in kot_rows:
-        order_id = kot_row["petpooja_order_id"]
+        if status == PETPOOJA_CANCELLED_STATUS:
+            conn.execute(
+                """
+                UPDATE kots
+                SET payment_status = 'PAID', push_status = 'CANCELLED', kitchen_status = ?
+                WHERE id = ?
+                """,
+                (status, kot_row["id"])
+            )
+        else:
+            conn.execute(
+                "UPDATE kots SET kitchen_status = ? WHERE id = ?",
+                (status, kot_row["id"])
+            )
 
-        if not order_id:
-            continue
+        conn.commit()
 
-        try:
-            status_response = petpooja_client.get_order_status(order_id)
-        except PetPoojaError as exc:
-            print(f"[petpooja-poll] status check failed for order {order_id}: {exc}")
-            continue
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS count FROM kots WHERE table_id = ? AND payment_status = 'UNPAID'",
+            (kot_row["table_id"],)
+        ).fetchone()
 
-        status_value = str(status_response.get("status", "")).strip().lower()  # PLACEHOLDER field name
+    if status == PETPOOJA_CANCELLED_STATUS and remaining["count"] == 0:
+        settle_and_clear_table(kot_row["table_id"])
 
-        if status_value in PETPOOJA_SETTLED_STATUSES:
-            with get_db_connection() as conn:
-                conn.execute(
-                    "UPDATE kots SET payment_status = 'PAID' WHERE id = ?",
-                    (kot_row["id"],)
-                )
-                conn.commit()
-            tables_touched.add(kot_row["table_id"])
-        elif status_value in PETPOOJA_CANCELLED_STATUSES:
-            with get_db_connection() as conn:
-                conn.execute(
-                    "UPDATE kots SET payment_status = 'PAID', push_status = 'CANCELLED' WHERE id = ?",
-                    (kot_row["id"],)
-                )
-                conn.commit()
-            tables_touched.add(kot_row["table_id"])
-            print(f"[petpooja-poll] order {order_id} was cancelled/voided in PetPooja")
-
-    for table_id in tables_touched:
-        with get_db_connection() as conn:
-            remaining = conn.execute(
-                "SELECT COUNT(*) AS count FROM kots WHERE table_id = ? AND payment_status = 'UNPAID'",
-                (table_id,)
-            ).fetchone()
-
-        if remaining["count"] == 0:
-            settle_and_clear_table(table_id)
-            print(f"[petpooja-poll] table_id={table_id} fully resolved in PetPooja — cleared locally")
-
-
-def start_settlement_poller(interval_seconds=20):
-    """Starts the background polling thread once (guarded against the Flask
-    debug reloader, which otherwise spawns two processes and would start the
-    poller twice)."""
-    is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
-
-    if app.debug and not is_reloader_child:
-        return  # this is the reloader's parent watcher process, not the real app
-
-    def _loop():
-        while True:
-            time.sleep(interval_seconds)
-            try:
-                poll_petpooja_settlements()
-            except Exception as exc:  # keep the poller alive no matter what
-                print(f"[petpooja-poll] unexpected error: {exc}")
-
-    thread = threading.Thread(target=_loop, daemon=True)
-    thread.start()
+    return {"success": "1"}, 200
 
 # FALLBACK MENU DATA — used until PetPooja is synced & category_map.json is filled in.
 FALLBACK_MENU = {
@@ -925,9 +901,6 @@ MENU_LOOKUP = {}
 MENU_LOOKUP_ITEMS = {}
 refresh_menu_globals()
 
-start_settlement_poller()
-
-
 
 @app.route("/")
 def home():
@@ -1198,59 +1171,132 @@ def updatecartqty():
     )
 
 
-def build_petpooja_order_payload(table, customer_info, kot_type, kot_number, table_cart, total):
+def build_petpooja_order_payload(table, customer_info, kot_type, client_order_id, table_cart, total):
     """
-    Builds the Save Order payload sent to PetPooja.
-    PLACEHOLDER shape — correct field names once real PetPooja docs are available
-    (see PETPOOJA_SETUP.md). petpooja_client.push_order() merges this with auth fields.
+    Builds the "orderinfo" object for PetPooja's real Save Order API
+    (PetpoojaOnlineOrdering APIs V2.1.0) — OrderInfo.Restaurant, Customer,
+    Order, OrderItem, Tax, Discount, each wrapped in a "details" key per the
+    real schema. petpooja_client.push_order() wraps this with app_key/
+    app_secret/access_token/udid/device_type.
+
+    order_type codes come from PetPooja's docs ("sc_applicable_on": "H,P,D"):
+    H = Home delivery, P = Pickup/Takeaway, D = Dine-in. This restaurant only
+    ever uses P or D.
     """
     is_takeaway = table.upper().startswith("TK")
     gst = round(total * 0.05, 2)
+    grand_total = round(total + gst, 2)
+    callback_url = f"{PUBLIC_BASE_URL}/petpooja/callback" if PUBLIC_BASE_URL else ""
+
+    order_items = []
+    for item in table_cart:
+        item_total = item["price"] * item["quantity"]
+        item_gst = round(item_total * 0.05, 2)
+        order_items.append({
+            "id": item.get("petpooja_item_id", ""),
+            "name": item["name"],
+            "tax_inclusive": False,
+            "gst_liability": "restaurant",
+            "item_tax": [
+                {"id": "", "name": "GST", "tax_percentage": "5", "amount": str(item_gst)}
+            ],
+            "item_discount": "",
+            "price": str(item["price"]),
+            "final_price": str(item_total),
+            "quantity": str(item["quantity"]),
+            "description": item.get("instructions") or "",
+            "variation_name": "",
+            "variation_id": "",
+            "AddonItem": {"details": []},
+        })
 
     return {
         "OrderInfo": {
-            "Customer": {
-                "name": customer_info["name"],
-                "phone": customer_info["phone"],
-            },
-            "OrderType": "Takeaway" if is_takeaway else "Dine In",
-            "TableNo": table,
-            "LocalOrderId": f"KOT{kot_number}",
-            "OrderItem": [
-                {
-                    "name": item["name"],
-                    "price": item["price"],
-                    "quantity": item["quantity"],
-                    "special_instructions": item.get("instructions") or "",
+            "Restaurant": {
+                "details": {
+                    "res_name": os.environ.get("PETPOOJA_RES_NAME", ""),
+                    "address": os.environ.get("PETPOOJA_RES_ADDRESS", ""),
+                    "contact_information": os.environ.get("PETPOOJA_RES_CONTACT", ""),
+                    "restID": petpooja_client.rest_id or "",
                 }
-                for item in table_cart
-            ],
-            "Tax": [{"name": "GST", "amount": gst}],
-            "total": round(total + gst, 2),
-        }
+            }
+        },
+        "Customer": {
+            "details": {
+                "email": "",
+                "name": customer_info["name"],
+                "address": "",
+                "phone": customer_info["phone"],
+            }
+        },
+        "Order": {
+            "details": {
+                "orderID": client_order_id,
+                "service_charge": "0",
+                "sc_tax_amount": "0",
+                "delivery_charges": "0",
+                "dc_tax_percentage": "0",
+                "dc_tax_amount": "0",
+                "packing_charges": "0",
+                "pc_tax_percentage": "0",
+                "pc_tax_amount": "0",
+                "order_type": "P" if is_takeaway else "D",
+                "advanced_order": "N",
+                "payment_type": "COD",
+                "table_no": "" if is_takeaway else table,
+                "no_of_persons": "0",
+                "discount_total": "0",
+                "tax_total": str(gst),
+                "discount_type": "F",
+                "total": str(grand_total),
+                "description": kot_type,
+                "created_on": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "enable_delivery": 0,
+                "min_prep_time": 20,
+                "callback_url": callback_url,
+            }
+        },
+        "OrderItem": {"details": order_items},
+        "Tax": {
+            "details": [
+                {
+                    "id": "",
+                    "title": "GST",
+                    "type": "P",
+                    "price": "5",
+                    "tax": str(gst),
+                    "restaurant_liable_amt": str(gst),
+                }
+            ]
+        },
+        "Discount": {"details": []},
     }
 
 
-def push_kot_to_petpooja(kot_id, order_payload):
+def push_kot_to_petpooja(kot_id, client_order_id, order_payload):
     """
     Fire-and-record call to PetPooja after the local KOT is already committed.
     Never raises — customer flow must not break if PetPooja is unreachable;
     push_status/push_error are stored so staff can be alerted instead.
+
+    client_order_id is always saved (even on failure/pending) so the
+    /petpooja/callback webhook can match a later status update back to this
+    KOT once the order is eventually retried/accepted.
     """
     if not petpooja_client.is_configured():
         push_status, petpooja_order_id, push_error = "PENDING", None, "PetPooja credentials not configured yet"
     else:
         try:
             response = petpooja_client.push_order(order_payload)
-            petpooja_order_id = str(response.get("order_id", ""))  # PLACEHOLDER field name
+            petpooja_order_id = str(response.get("orderID", ""))
             push_status, push_error = "SENT", None
         except PetPoojaError as exc:
             push_status, petpooja_order_id, push_error = "FAILED", None, str(exc)
 
     with get_db_connection() as conn:
         conn.execute(
-            "UPDATE kots SET petpooja_order_id = ?, push_status = ?, push_error = ? WHERE id = ?",
-            (petpooja_order_id, push_status, push_error, kot_id)
+            "UPDATE kots SET petpooja_order_id = ?, client_order_id = ?, push_status = ?, push_error = ? WHERE id = ?",
+            (petpooja_order_id, client_order_id, push_status, push_error, kot_id)
         )
         conn.commit()
 
@@ -1367,10 +1413,11 @@ def placeorder():
     table_gst = round(table_food_total * 0.05, 2)
     table_total_with_gst = round(table_food_total + table_gst, 2)
 
+    client_order_id = f"KOT{next_kot_number}"
     order_payload = build_petpooja_order_payload(
-        table, customer_info, kot_type, next_kot_number, table_cart, total
+        table, customer_info, kot_type, client_order_id, table_cart, total
     )
-    push_status = push_kot_to_petpooja(kot_id, order_payload)
+    push_status = push_kot_to_petpooja(kot_id, client_order_id, order_payload)
 
     return render_template(
         "order_success.html",
@@ -1486,37 +1533,37 @@ def takeaway_start():
     return redirect(f"/menu?table={token}")
 
 
-@app.route("/admin/poll-settlements")
-@require_admin_token
-def admin_poll_settlements():
+@app.route("/petpooja/callback", methods=["POST"])
+def petpooja_callback():
     """
-    Manually triggers one settlement-poll cycle immediately, instead of
-    waiting for the background thread's interval. Useful for testing.
+    Webhook PetPooja calls to report order status changes (per the real
+    Save Order API's "callback_url" field). This endpoint's URL is what we
+    send as callback_url on every order — must be the public PUBLIC_BASE_URL,
+    not localhost, once real credentials are in use.
     """
-    poll_petpooja_settlements()
-    return jsonify({"status": "ok", "message": "Poll cycle executed. Check server logs for details."})
+    payload = request.get_json(silent=True) or {}
+    result, status_code = handle_petpooja_callback(payload)
+    return jsonify(result), status_code
 
 
-@app.route("/admin/sync-menu")
-@require_admin_token
-def admin_sync_menu():
+@app.route("/petpooja/push-menu", methods=["POST"])
+def petpooja_push_menu():
     """
-    Manually triggers a PetPooja menu pull and rebuilds the live menu.
+    Webhook PetPooja calls whenever the restaurant's menu changes in their
+    system (the real "Push Menu" API — the old pull-based Fetch Menu API is
+    deprecated). No admin token required since PetPooja itself calls this,
+    but PetPooja's own restID in the payload is checked against ours so a
+    stray/forged call can't overwrite the menu.
     """
-    if not petpooja_client.is_configured():
-        return jsonify({
-            "status": "not_configured",
-            "message": (
-                "Set PETPOOJA_APP_KEY, PETPOOJA_APP_SECRET, PETPOOJA_ACCESS_TOKEN "
-                "and PETPOOJA_REST_ID as environment variables, then retry."
-            )
-        }), 400
+    payload = request.get_json(silent=True) or {}
 
-    try:
-        normalized_items, raw_categories_seen = sync_menu_from_petpooja()
-    except PetPoojaError as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 502
+    restaurants = payload.get("restaurants", [])
+    incoming_rest_id = restaurants[0].get("restaurantid") if restaurants else None
 
+    if petpooja_client.rest_id and incoming_rest_id and str(incoming_rest_id) != str(petpooja_client.rest_id):
+        return jsonify({"success": "0", "message": "restaurantid mismatch"}), 403
+
+    normalized_items, raw_categories_seen = ingest_petpooja_menu_push(payload)
     refresh_menu_globals()
 
     category_map = load_category_map()
@@ -1524,16 +1571,63 @@ def admin_sync_menu():
         str(pid) for ids in category_map.values() for pid in ids
     }
 
+    if unmapped_ids:
+        print(f"[petpooja-menu] unmapped category ids: {sorted(unmapped_ids)} — add them to category_map.json")
+
+    return jsonify({"success": "1", "items_synced": len(normalized_items)})
+
+
+@app.route("/admin/settle-table", methods=["POST"])
+@require_admin_token
+def admin_settle_table():
+    """
+    Manual fallback for staff to mark a table fully settled/paid, since
+    PetPooja's documented API has no "bill paid" webhook/field — only
+    kitchen-progress statuses. Use this until PetPooja confirms how (or
+    whether) a payment signal can be delivered to third-party apps.
+    """
+    table = (request.form.get("table") or request.args.get("table") or "").strip()
+
+    if not table:
+        return jsonify({"status": "error", "message": "table is required"}), 400
+
+    table_id = get_or_create_table_id(table)
+    settle_and_clear_table(table_id)
+
+    return jsonify({"status": "ok", "table": table})
+
+
+@app.route("/admin/menu-status")
+@require_admin_token
+def admin_menu_status():
+    """
+    Read-only visibility into the last menu push received from PetPooja —
+    useful since menu sync is now inbound-only (no manual pull trigger).
+    """
+    cached_items = load_petpooja_items_from_db()
+    category_map = load_category_map()
+
+    raw_categories_seen = sorted({
+        (item["petpooja_category_id"], item["petpooja_category_name"])
+        for item in cached_items
+        if item["petpooja_category_id"]
+    })
+    unmapped_ids = {cat_id for cat_id, _ in raw_categories_seen} - {
+        str(pid) for ids in category_map.values() for pid in ids
+    }
+
     return jsonify({
         "status": "ok",
-        "items_synced": len(normalized_items),
+        "items_cached": len(cached_items),
         "raw_categories_seen": [
             {"category_id": cid, "category_name": cname} for cid, cname in raw_categories_seen
         ],
         "unmapped_category_ids": sorted(unmapped_ids),
         "note": (
-            "Add any unmapped_category_ids to category_map.json under the matching "
-            "our_category_key, then call /admin/sync-menu again to pick them up."
+            "Menu sync is inbound-only: PetPooja calls /petpooja/push-menu whenever "
+            "their menu changes. Add any unmapped_category_ids to category_map.json "
+            "under the matching our_category_key, then wait for (or ask PetPooja to "
+            "resend) the next push."
         )
     })
 

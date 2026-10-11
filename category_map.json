@@ -1,5 +1,5 @@
 {
-  "_comment": "Map each of our existing menu UI category keys to the PetPooja category_id(s) that should feed into it. Fill these in once you've pulled a real menu from PetPooja (use /admin/sync-menu to preview raw categories first). Leave a key with an empty list if that category isn't mapped yet — it will just show as empty until you fill it in.",
+  "_comment": "Map each of our existing menu UI category keys to the PetPooja category_id(s) that should feed into it. Menu sync is inbound-only (PetPooja calls /petpooja/push-menu when their menu changes) — check /admin/menu-status?token=... to see raw categories seen so far. Leave a key with an empty list if that category isn't mapped yet — it will just show as empty until you fill it in.",
   "veg_soups": [],
   "veg_starters": [],
   "veg_tikka": [],
